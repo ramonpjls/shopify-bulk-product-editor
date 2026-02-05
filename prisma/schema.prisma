@@ -13,6 +13,18 @@ datasource db {
   url      = "file:dev.sqlite"
 }
 
+enum OperationType {
+  PRICE_ADJUSTMENT
+}
+
+enum OperationStatus {
+  CREATED
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
 model Session {
   id            String    @id
   shop          String
@@ -31,4 +43,21 @@ model Session {
   emailVerified Boolean?  @default(false)
   refreshToken        String?
   refreshTokenExpires DateTime?
+}
+
+model Operation {
+  id             String           @id @default(cuid())
+  shop           String
+  type           OperationType
+  status         OperationStatus  @default(CREATED)
+  payload        Json
+  inversePayload Json?
+  bulkOperationId String?         @unique
+  resultUrl      String?
+  errorMessage   String?
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+  completedAt    DateTime?
+
+  @@index([shop, status])
 }
