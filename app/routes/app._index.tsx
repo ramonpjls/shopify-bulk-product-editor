@@ -1,250 +1,508 @@
-import { useEffect } from "react";
+import { useAppBridge } from "@shopify/app-bridge-react";
+import { boundary } from "@shopify/shopify-app-react-router/server";
+import { useEffect, useState } from "react";
 import type {
   ActionFunctionArgs,
   HeadersFunction,
   LoaderFunctionArgs,
 } from "react-router";
-import { useFetcher } from "react-router";
-import { useAppBridge } from "@shopify/app-bridge-react";
+import { Form, useFetcher, useLoaderData } from "react-router";
+
+import {
+  buildPriceAdjustmentPreview,
+  fetchProductList,
+  type PricePreviewResult,
+  type ProductListItem,
+  type ProductStatusFilter,
+} from "../services/products.server";
 import { authenticate } from "../shopify.server";
-import { boundary } from "@shopify/shopify-app-react-router/server";
+
+type LoaderData = {
+  products: ProductListItem[];
+  pageInfo: {
+    hasNextPage: boolean;
+    hasPreviousPage: boolean;
+    startCursor: string | null;
+    endCursor: string | null;
+  };
+  availableTags: string[];
+  filters: {
+    status: ProductStatusFilter;
+    tagsInput: string;
+  };
+};
+
+type ActionData = {
+  preview?: PricePreviewResult;
+  errors?: {
+    productIds?: string;
+    percentage?: string;
+    form?: string;
+  };
+};
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  await authenticate.admin(request);
+  const { admin } = await authenticate.admin(request);
+  const url = new URL(request.url);
 
-  return null;
+  const status = parseStatus(url.searchParams.get("status"));
+  const tagsInput = url.searchParams.get("tags") ?? "";
+  const cursor = url.searchParams.get("cursor") ?? undefined;
+  const direction =
+    url.searchParams.get("direction") === "backward" ? "backward" : "forward";
+
+  const tags = tagsInput
+    .split(",")
+    .map((tag) => tag.trim())
+    .filter(Boolean);
+
+  const list = await fetchProductList(admin, {
+    status,
+    tags,
+    cursor,
+    direction,
+    pageSize: 25,
+  });
+
+  return {
+    products: list.products,
+    pageInfo: list.pageInfo,
+    availableTags: list.availableTags,
+    filters: {
+      status,
+      tagsInput,
+    },
+  } satisfies LoaderData;
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { admin } = await authenticate.admin(request);
-  const color = ["Red", "Orange", "Yellow", "Green"][
-    Math.floor(Math.random() * 4)
-  ];
-  const response = await admin.graphql(
-    `#graphql
-      mutation populateProduct($product: ProductCreateInput!) {
-        productCreate(product: $product) {
-          product {
-            id
-            title
-            handle
-            status
-            variants(first: 10) {
-              edges {
-                node {
-                  id
-                  price
-                  barcode
-                  createdAt
-                }
-              }
-            }
-          }
-        }
-      }`,
+  const formData = await request.formData();
+  const intent = formData.get("_action");
+
+  if (intent === "preview-price-adjustment") {
+    const productIds = formData
+      .getAll("productIds")
+      .map(String)
+      .filter(Boolean);
+    const direction =
+      formData.get("direction") === "decrease" ? "decrease" : "increase";
+    const percentageValue = Number(formData.get("percentage"));
+
+    const errors: ActionData["errors"] = {};
+
+    if (productIds.length === 0) {
+      errors.productIds = "Select at least one product to preview changes.";
+    }
+
+    if (!Number.isFinite(percentageValue) || percentageValue <= 0) {
+      errors.percentage = "Enter a percentage greater than zero.";
+    } else if (percentageValue > 1000) {
+      errors.percentage = "Percentage is too large.";
+    }
+
+    if (errors.productIds || errors.percentage) {
+      return Response.json({ errors }, { status: 400 });
+    }
+
+    try {
+      const preview = await buildPriceAdjustmentPreview(admin, productIds, {
+        direction,
+        percentage: percentageValue,
+      });
+      return Response.json({ preview });
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Unable to build price preview. Please try again.";
+      return Response.json({ errors: { form: message } }, { status: 500 });
+    }
+  }
+
+  return Response.json(
     {
-      variables: {
-        product: {
-          title: `${color} Snowboard`,
-        },
+      errors: {
+        form: "Unsupported action.",
       },
     },
+    { status: 400 },
   );
-  const responseJson = await response.json();
-
-  const product = responseJson.data!.productCreate!.product!;
-  const variantId = product.variants.edges[0]!.node!.id!;
-
-  const variantResponse = await admin.graphql(
-    `#graphql
-    mutation shopifyReactRouterTemplateUpdateVariant($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
-      productVariantsBulkUpdate(productId: $productId, variants: $variants) {
-        productVariants {
-          id
-          price
-          barcode
-          createdAt
-        }
-      }
-    }`,
-    {
-      variables: {
-        productId: product.id,
-        variants: [{ id: variantId, price: "100.00" }],
-      },
-    },
-  );
-
-  const variantResponseJson = await variantResponse.json();
-
-  return {
-    product: responseJson!.data!.productCreate!.product,
-    variant:
-      variantResponseJson!.data!.productVariantsBulkUpdate!.productVariants,
-  };
 };
 
 export default function Index() {
-  const fetcher = useFetcher<typeof action>();
-
+  const { products, pageInfo, filters, availableTags } =
+    useLoaderData<typeof loader>();
+  const fetcher = useFetcher<ActionData>();
   const shopify = useAppBridge();
-  const isLoading =
-    ["loading", "submitting"].includes(fetcher.state) &&
-    fetcher.formMethod === "POST";
+
+  const [selectedProductIds, setSelectedProductIds] = useState<string[]>([]);
+  const [direction, setDirection] = useState<"increase" | "decrease">(
+    "increase",
+  );
+  const [percentage, setPercentage] = useState("10");
+
+  const isPreviewing =
+    fetcher.state === "submitting" &&
+    fetcher.formData?.get("_action") === "preview-price-adjustment";
+
+  const preview = fetcher.data?.preview;
+  const actionErrors = fetcher.data?.errors;
 
   useEffect(() => {
-    if (fetcher.data?.product?.id) {
-      shopify.toast.show("Product created");
+    if (fetcher.state !== "idle" || !fetcher.data) {
+      return;
     }
-  }, [fetcher.data?.product?.id, shopify]);
 
-  const generateProduct = () => fetcher.submit({}, { method: "POST" });
+    if (fetcher.data.errors?.form) {
+      shopify.toast.show(fetcher.data.errors.form, { isError: true });
+    } else if (fetcher.data.preview) {
+      shopify.toast.show("Preview ready");
+    }
+  }, [fetcher.data, fetcher.state, shopify]);
+
+  useEffect(() => {
+    setSelectedProductIds([]);
+  }, [products.map((product) => product.id).join(",")]);
+
+  const allSelected =
+    selectedProductIds.length > 0 &&
+    selectedProductIds.length === products.length;
+
+  const toggleSelectAll = () => {
+    if (allSelected) {
+      setSelectedProductIds([]);
+    } else {
+      setSelectedProductIds(products.map((product) => product.id));
+    }
+  };
+
+  const toggleProduct = (productId: string) => {
+    setSelectedProductIds((current) =>
+      current.includes(productId)
+        ? current.filter((id) => id !== productId)
+        : [...current, productId],
+    );
+  };
 
   return (
-    <s-page heading="Shopify app template">
-      <s-button slot="primary-action" onClick={generateProduct}>
-        Generate a product
-      </s-button>
-
-      <s-section heading="Congrats on creating a new Shopify app 🎉">
-        <s-paragraph>
-          This embedded app template uses{" "}
-          <s-link
-            href="https://shopify.dev/docs/apps/tools/app-bridge"
-            target="_blank"
+    <s-page heading="Bulk price adjustment">
+      <div slot="primary-action">
+        <fetcher.Form method="post" replace>
+          <input
+            type="hidden"
+            name="_action"
+            value="preview-price-adjustment"
+          />
+          {selectedProductIds.map((id) => (
+            <input key={id} type="hidden" name="productIds" value={id} />
+          ))}
+          <div
+            style={{
+              display: "flex",
+              gap: "var(--s-space-4)",
+              flexWrap: "wrap",
+            }}
           >
-            App Bridge
-          </s-link>{" "}
-          interface examples like an{" "}
-          <s-link href="/app/additional">additional page in the app nav</s-link>
-          , as well as an{" "}
-          <s-link
-            href="https://shopify.dev/docs/api/admin-graphql"
-            target="_blank"
-          >
-            Admin GraphQL
-          </s-link>{" "}
-          mutation demo, to provide a starting point for app development.
-        </s-paragraph>
-      </s-section>
-      <s-section heading="Get started with products">
-        <s-paragraph>
-          Generate a product with GraphQL and get the JSON output for that
-          product. Learn more about the{" "}
-          <s-link
-            href="https://shopify.dev/docs/api/admin-graphql/latest/mutations/productCreate"
-            target="_blank"
-          >
-            productCreate
-          </s-link>{" "}
-          mutation in our API references.
-        </s-paragraph>
-        <s-stack direction="inline" gap="base">
-          <s-button
-            onClick={generateProduct}
-            {...(isLoading ? { loading: true } : {})}
-          >
-            Generate a product
-          </s-button>
-          {fetcher.data?.product && (
-            <s-button
-              onClick={() => {
-                shopify.intents.invoke?.("edit:shopify/Product", {
-                  value: fetcher.data?.product?.id,
-                });
-              }}
-              target="_blank"
-              variant="tertiary"
-            >
-              Edit product
+            <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <span>Direction</span>
+              <select
+                name="direction"
+                value={direction}
+                onChange={(event) =>
+                  setDirection(
+                    event.currentTarget.value === "decrease"
+                      ? "decrease"
+                      : "increase",
+                  )
+                }
+              >
+                <option value="increase">Increase</option>
+                <option value="decrease">Decrease</option>
+              </select>
+            </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <span>Percentage</span>
+              <input
+                type="number"
+                min="0.01"
+                step="0.01"
+                name="percentage"
+                value={percentage}
+                onChange={(event) => setPercentage(event.currentTarget.value)}
+                style={{ width: 120 }}
+              />
+            </label>
+            <s-button type="submit" loading={isPreviewing} variant="primary">
+              Preview changes
             </s-button>
+          </div>
+          <input type="hidden" name="direction" value={direction} />
+          <input type="hidden" name="percentage" value={percentage} />
+          {actionErrors?.productIds && (
+            <p style={{ color: "var(--s-color-text-critical)" }}>
+              {actionErrors.productIds}
+            </p>
           )}
-        </s-stack>
-        {fetcher.data?.product && (
-          <s-section heading="productCreate mutation">
-            <s-stack direction="block" gap="base">
-              <s-box
-                padding="base"
-                borderWidth="base"
-                borderRadius="base"
-                background="subdued"
-              >
-                <pre style={{ margin: 0 }}>
-                  <code>{JSON.stringify(fetcher.data.product, null, 2)}</code>
-                </pre>
-              </s-box>
+          {actionErrors?.percentage && (
+            <p style={{ color: "var(--s-color-text-critical)" }}>
+              {actionErrors.percentage}
+            </p>
+          )}
+        </fetcher.Form>
+      </div>
 
-              <s-heading>productVariantsBulkUpdate mutation</s-heading>
-              <s-box
-                padding="base"
-                borderWidth="base"
-                borderRadius="base"
-                background="subdued"
-              >
-                <pre style={{ margin: 0 }}>
-                  <code>{JSON.stringify(fetcher.data.variant, null, 2)}</code>
-                </pre>
-              </s-box>
-            </s-stack>
-          </s-section>
-        )}
-      </s-section>
-
-      <s-section slot="aside" heading="App template specs">
-        <s-paragraph>
-          <s-text>Framework: </s-text>
-          <s-link href="https://reactrouter.com/" target="_blank">
-            React Router
-          </s-link>
-        </s-paragraph>
-        <s-paragraph>
-          <s-text>Interface: </s-text>
-          <s-link
-            href="https://shopify.dev/docs/api/app-home/using-polaris-components"
-            target="_blank"
-          >
-            Polaris web components
-          </s-link>
-        </s-paragraph>
-        <s-paragraph>
-          <s-text>API: </s-text>
-          <s-link
-            href="https://shopify.dev/docs/api/admin-graphql"
-            target="_blank"
-          >
-            GraphQL
-          </s-link>
-        </s-paragraph>
-        <s-paragraph>
-          <s-text>Database: </s-text>
-          <s-link href="https://www.prisma.io/" target="_blank">
-            Prisma
-          </s-link>
-        </s-paragraph>
-      </s-section>
-
-      <s-section slot="aside" heading="Next steps">
-        <s-unordered-list>
-          <s-list-item>
-            Build an{" "}
-            <s-link
-              href="https://shopify.dev/docs/apps/getting-started/build-app-example"
-              target="_blank"
+      <s-layout>
+        <s-layout-section>
+          <s-card>
+            <Form
+              method="get"
+              style={{
+                display: "flex",
+                gap: "var(--s-space-4)",
+                flexWrap: "wrap",
+              }}
             >
-              example app
-            </s-link>
-          </s-list-item>
-          <s-list-item>
-            Explore Shopify&apos;s API with{" "}
-            <s-link
-              href="https://shopify.dev/docs/apps/tools/graphiql-admin-api"
-              target="_blank"
+              <label
+                style={{ display: "flex", flexDirection: "column", gap: 4 }}
+              >
+                <span>Status</span>
+                <select name="status" defaultValue={filters.status}>
+                  <option value="ANY">Any</option>
+                  <option value="ACTIVE">Active</option>
+                  <option value="DRAFT">Draft</option>
+                  <option value="ARCHIVED">Archived</option>
+                </select>
+              </label>
+
+              <label
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 4,
+                  minWidth: 240,
+                }}
+              >
+                <span>Tags (comma-separated)</span>
+                <input
+                  type="text"
+                  name="tags"
+                  defaultValue={filters.tagsInput}
+                  placeholder="summer, sale"
+                />
+              </label>
+
+              <div style={{ alignSelf: "flex-end" }}>
+                <s-button type="submit" variant="primary">
+                  Apply filters
+                </s-button>
+              </div>
+            </Form>
+
+            {availableTags.length > 0 && (
+              <s-box style={{ marginTop: "var(--s-space-4)" }}>
+                <s-text tone="neutral">
+                  Suggested tags: {availableTags.slice(0, 10).join(", ")}
+                  {availableTags.length > 10 ? " …" : ""}
+                </s-text>
+              </s-box>
+            )}
+
+            <div style={{ marginTop: "var(--s-space-5)", overflowX: "auto" }}>
+              <table className="product-table">
+                <thead>
+                  <tr>
+                    <th style={{ width: 40 }}>
+                      <input
+                        type="checkbox"
+                        aria-label="Select all products"
+                        checked={allSelected}
+                        onChange={toggleSelectAll}
+                      />
+                    </th>
+                    <th>Product</th>
+                    <th>Status</th>
+                    <th>Tags</th>
+                    <th>Variants (price)</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {products.map((product: ProductListItem) => {
+                    const selected = selectedProductIds.includes(product.id);
+
+                    return (
+                      <tr key={product.id}>
+                        <td>
+                          <input
+                            type="checkbox"
+                            aria-label={`Select ${product.title}`}
+                            checked={selected}
+                            onChange={() => toggleProduct(product.id)}
+                          />
+                        </td>
+                        <td>
+                          <strong>{product.title}</strong>
+                        </td>
+                        <td>{product.status.toLowerCase()}</td>
+                        <td>
+                          {product.tags.length ? product.tags.join(", ") : "—"}
+                        </td>
+                        <td>
+                          <ul
+                            style={{ margin: 0, paddingInlineStart: "1.2rem" }}
+                          >
+                            {product.variants.map((variant) => (
+                              <li key={variant.id}>
+                                {variant.title} · {variant.price.toFixed(2)}{" "}
+                                {variant.currencyCode}
+                              </li>
+                            ))}
+                          </ul>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                  {products.length === 0 && (
+                    <tr>
+                      <td colSpan={5}>
+                        <s-text tone="neutral">
+                          No products match your filters.
+                        </s-text>
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                marginTop: "var(--s-space-5)",
+                flexWrap: "wrap",
+                gap: "var(--s-space-4)",
+              }}
             >
-              GraphiQL
-            </s-link>
-          </s-list-item>
-        </s-unordered-list>
-      </s-section>
+              <div>
+                <s-text tone="neutral">
+                  Selected products: {selectedProductIds.length}
+                </s-text>
+              </div>
+              <div style={{ display: "flex", gap: "var(--s-space-3)" }}>
+                {pageInfo.hasPreviousPage && pageInfo.startCursor && (
+                  <Form method="get">
+                    <input type="hidden" name="status" value={filters.status} />
+                    <input
+                      type="hidden"
+                      name="tags"
+                      value={filters.tagsInput}
+                    />
+                    <input
+                      type="hidden"
+                      name="cursor"
+                      value={pageInfo.startCursor}
+                    />
+                    <input type="hidden" name="direction" value="backward" />
+                    <s-button type="submit" variant="tertiary">
+                      Previous
+                    </s-button>
+                  </Form>
+                )}
+                {pageInfo.hasNextPage && pageInfo.endCursor && (
+                  <Form method="get">
+                    <input type="hidden" name="status" value={filters.status} />
+                    <input
+                      type="hidden"
+                      name="tags"
+                      value={filters.tagsInput}
+                    />
+                    <input
+                      type="hidden"
+                      name="cursor"
+                      value={pageInfo.endCursor}
+                    />
+                    <input type="hidden" name="direction" value="forward" />
+                    <s-button type="submit" variant="tertiary">
+                      Next
+                    </s-button>
+                  </Form>
+                )}
+              </div>
+            </div>
+          </s-card>
+        </s-layout-section>
+
+        <s-layout-section variant="oneThird">
+          <s-card>
+            <s-heading level={2}>Preview</s-heading>
+            {isPreviewing && (
+              <s-box style={{ marginTop: "var(--s-space-4)" }}>
+                <s-text tone="neutral">Generating preview…</s-text>
+              </s-box>
+            )}
+
+            {!isPreviewing && preview && preview.products.length > 0 && (
+              <div
+                style={{
+                  marginTop: "var(--s-space-4)",
+                  display: "grid",
+                  gap: "var(--s-space-4)",
+                }}
+              >
+                {preview.products.map((product) => (
+                  <s-box
+                    key={product.id}
+                    padding="base"
+                    borderWidth="base"
+                    borderRadius="base"
+                    background="subdued"
+                  >
+                    <strong>{product.title}</strong>
+                    <ul
+                      style={{
+                        marginTop: "var(--s-space-3)",
+                        paddingInlineStart: "1.2rem",
+                      }}
+                    >
+                      {product.variants.map((variant) => (
+                        <li key={variant.id}>
+                          {variant.title}: {variant.priceBefore.toFixed(2)} →{" "}
+                          <strong>{variant.priceAfter.toFixed(2)}</strong>{" "}
+                          {variant.currencyCode}
+                        </li>
+                      ))}
+                    </ul>
+                  </s-box>
+                ))}
+              </div>
+            )}
+
+            {!isPreviewing && preview && preview.products.length === 0 && (
+              <s-box style={{ marginTop: "var(--s-space-4)" }}>
+                <s-text tone="neutral">
+                  Selected products have no variants with prices to update.
+                </s-text>
+              </s-box>
+            )}
+
+            {!isPreviewing && !preview && (
+              <s-box style={{ marginTop: "var(--s-space-4)" }}>
+                <s-text tone="neutral">
+                  Select products and submit a preview to see before/after
+                  pricing.
+                </s-text>
+              </s-box>
+            )}
+
+            {actionErrors?.form && (
+              <s-box style={{ marginTop: "var(--s-space-4)" }}>
+                <s-text tone="critical">{actionErrors.form}</s-text>
+              </s-box>
+            )}
+          </s-card>
+        </s-layout-section>
+      </s-layout>
     </s-page>
   );
 }
@@ -252,3 +510,21 @@ export default function Index() {
 export const headers: HeadersFunction = (headersArgs) => {
   return boundary.headers(headersArgs);
 };
+
+function parseStatus(value: string | null): ProductStatusFilter {
+  if (!value) {
+    return "ANY";
+  }
+
+  const normalized = value.toUpperCase();
+
+  if (
+    normalized === "ACTIVE" ||
+    normalized === "DRAFT" ||
+    normalized === "ARCHIVED"
+  ) {
+    return normalized as ProductStatusFilter;
+  }
+
+  return "ANY";
+}
