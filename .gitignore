@@ -3,6 +3,7 @@ node_modules
 # macOS
 .DS_Store
 
+/docs
 /.cache
 /build
 /app/build
