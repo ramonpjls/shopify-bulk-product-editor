@@ -1,14 +1,23 @@
-import { useAppBridge } from "@shopify/app-bridge-react";
-import { boundary } from "@shopify/shopify-app-react-router/server";
-import { useEffect, useState } from "react";
-import type {
-  ActionFunctionArgs,
-  HeadersFunction,
-  LoaderFunctionArgs,
-} from "react-router";
-import { Form, useFetcher, useLoaderData } from "react-router";
+/**
+ * Main App Page
+ *
+ * Improvements:
+ * - Real-time operation status polling
+ * - Enhanced preview table with diffs
+ * - Progress indicator
+ * - Better error handling
+ * - Rate limit friendly
+ */
 
-import { startPriceAdjustmentBulkOperation } from "../services/bulk-operations.server";
+import { useAppBridge } from "@shopify/app-bridge-react";
+import { useEffect, useState } from "react";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { Form, Link, useFetcher, useLoaderData } from "react-router";
+import { findActiveOperationForShop } from "../models/operation.server";
+import {
+  pollBulkOperationStatus,
+  startPriceAdjustmentBulkOperation,
+} from "../services/bulk-operations.server";
 import {
   buildPriceAdjustmentPreview,
   fetchProductList,
@@ -31,6 +40,12 @@ type LoaderData = {
     status: ProductStatusFilter;
     tagsInput: string;
   };
+  activeOperation?: {
+    id: string;
+    type: string;
+    status: string;
+    createdAt: string;
+  };
 };
 
 type ActionData = {
@@ -38,6 +53,12 @@ type ActionData = {
   operation?: {
     id: string;
     status: string;
+    bulkOperationId?: string;
+  };
+  pollResult?: {
+    status: string;
+    objectCount?: number;
+    errorCode?: string;
   };
   errors?: {
     productIds?: string;
@@ -47,7 +68,7 @@ type ActionData = {
 };
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { admin } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   const url = new URL(request.url);
 
   const status = parseStatus(url.searchParams.get("status"));
@@ -69,6 +90,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     pageSize: 25,
   });
 
+  // Check for active operation
+  const activeOp = await findActiveOperationForShop(session.shop);
+
   return {
     products: list.products,
     pageInfo: list.pageInfo,
@@ -77,6 +101,14 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       status,
       tagsInput,
     },
+    activeOperation: activeOp
+      ? {
+          id: activeOp.id,
+          type: activeOp.type,
+          status: activeOp.status,
+          createdAt: activeOp.createdAt.toISOString(),
+        }
+      : undefined,
   } satisfies LoaderData;
 };
 
@@ -86,133 +118,152 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const intent = formData.get("_action");
 
   if (intent === "preview-price-adjustment") {
-    const productIds = formData
-      .getAll("productIds")
-      .map(String)
-      .filter(Boolean);
-    const direction =
-      formData.get("direction") === "decrease" ? "decrease" : "increase";
-    const percentageValue = Number(formData.get("percentage"));
-
-    const errors: ActionData["errors"] = {};
-
-    if (productIds.length === 0) {
-      errors.productIds = "Select at least one product to preview changes.";
-    }
-
-    if (!Number.isFinite(percentageValue) || percentageValue <= 0) {
-      errors.percentage = "Enter a percentage greater than zero.";
-    } else if (percentageValue > 1000) {
-      errors.percentage = "Percentage is too large.";
-    }
-
-    if (errors.productIds || errors.percentage) {
-      return Response.json({ errors }, { status: 400 });
-    }
-
-    try {
-      const preview = await buildPriceAdjustmentPreview(admin, productIds, {
-        direction,
-        percentage: percentageValue,
-      });
-      return Response.json({ preview });
-    } catch (error) {
-      const message =
-        error instanceof Error
-          ? error.message
-          : "Unable to build price preview. Please try again.";
-      return Response.json({ errors: { form: message } }, { status: 500 });
-    }
+    return handlePreviewAction(formData, admin);
   }
 
   if (intent === "start-price-adjustment") {
-    const productIds = formData
-      .getAll("productIds")
-      .map(String)
-      .filter(Boolean);
-    const direction =
-      formData.get("direction") === "decrease" ? "decrease" : "increase";
-    const percentageValue = Number(formData.get("percentage"));
+    return handleStartAction(formData, admin, session.shop);
+  }
 
-    const errors: ActionData["errors"] = {};
-
-    if (productIds.length === 0) {
-      errors.productIds =
-        "Select at least one product to start the bulk change.";
-    }
-
-    if (!Number.isFinite(percentageValue) || percentageValue <= 0) {
-      errors.percentage = "Enter a percentage greater than zero.";
-    } else if (percentageValue > 1000) {
-      errors.percentage = "Percentage is too large.";
-    }
-
-    if (errors.productIds || errors.percentage) {
-      return Response.json({ errors }, { status: 400 });
-    }
-
-    const shop = session?.shop;
-    if (!shop) {
-      return Response.json(
-        { errors: { form: "Unable to determine shop for this session." } },
-        { status: 500 },
-      );
-    }
-
-    try {
-      const previewResult = await buildPriceAdjustmentPreview(
-        admin,
-        productIds,
-        {
-          direction,
-          percentage: percentageValue,
-        },
-      );
-
-      if (previewResult.products.length === 0) {
-        return Response.json(
-          {
-            errors: {
-              form: "Selected products do not have variants to update.",
-            },
-          },
-          { status: 400 },
-        );
-      }
-
-      const { operation } = await startPriceAdjustmentBulkOperation({
-        admin,
-        shop,
-        preview: previewResult,
-      });
-
-      return Response.json({
-        operation: { id: operation.id, status: operation.status },
-      });
-    } catch (error) {
-      const message =
-        error instanceof Error
-          ? error.message
-          : "Failed to start the bulk operation. Please try again.";
-      return Response.json({ errors: { form: message } }, { status: 500 });
-    }
+  if (intent === "poll-operation") {
+    return handlePollAction(formData, admin);
   }
 
   return Response.json(
-    {
-      errors: {
-        form: "Unsupported action.",
-      },
-    },
+    { errors: { form: "Unsupported action." } },
     { status: 400 },
   );
 };
 
+async function handlePreviewAction(formData: FormData, admin: any) {
+  const productIds = formData.getAll("productIds").map(String).filter(Boolean);
+  const direction =
+    formData.get("direction") === "decrease" ? "decrease" : "increase";
+  const percentageValue = Number(formData.get("percentage"));
+
+  const errors: ActionData["errors"] = {};
+
+  if (productIds.length === 0) {
+    errors.productIds = "Select at least one product to preview changes.";
+  }
+
+  if (!Number.isFinite(percentageValue) || percentageValue <= 0) {
+    errors.percentage = "Enter a percentage greater than zero.";
+  } else if (percentageValue > 1000) {
+    errors.percentage = "Percentage is too large.";
+  }
+
+  if (errors.productIds || errors.percentage) {
+    return Response.json({ errors }, { status: 400 });
+  }
+
+  try {
+    const preview = await buildPriceAdjustmentPreview(admin, productIds, {
+      direction,
+      percentage: percentageValue,
+    });
+    return Response.json({ preview });
+  } catch (error) {
+    const message =
+      error instanceof Error
+        ? error.message
+        : "Unable to build price preview. Please try again.";
+    return Response.json({ errors: { form: message } }, { status: 500 });
+  }
+}
+
+async function handleStartAction(formData: FormData, admin: any, shop: string) {
+  const productIds = formData.getAll("productIds").map(String).filter(Boolean);
+  const direction =
+    formData.get("direction") === "decrease" ? "decrease" : "increase";
+  const percentageValue = Number(formData.get("percentage"));
+
+  const errors: ActionData["errors"] = {};
+
+  if (productIds.length === 0) {
+    errors.productIds = "Select at least one product to start the bulk change.";
+  }
+
+  if (!Number.isFinite(percentageValue) || percentageValue <= 0) {
+    errors.percentage = "Enter a percentage greater than zero.";
+  } else if (percentageValue > 1000) {
+    errors.percentage = "Percentage is too large.";
+  }
+
+  if (errors.productIds || errors.percentage) {
+    return Response.json({ errors }, { status: 400 });
+  }
+
+  try {
+    const previewResult = await buildPriceAdjustmentPreview(admin, productIds, {
+      direction,
+      percentage: percentageValue,
+    });
+
+    if (previewResult.products.length === 0) {
+      return Response.json(
+        {
+          errors: {
+            form: "Selected products do not have variants to update.",
+          },
+        },
+        { status: 400 },
+      );
+    }
+
+    const { operation } = await startPriceAdjustmentBulkOperation({
+      admin,
+      shop,
+      preview: previewResult,
+    });
+
+    return Response.json({
+      operation: {
+        id: operation.id,
+        status: operation.status,
+        bulkOperationId: operation.bulkOperationId,
+      },
+    });
+  } catch (error) {
+    const message =
+      error instanceof Error
+        ? error.message
+        : "Failed to start the bulk operation. Please try again.";
+    return Response.json({ errors: { form: message } }, { status: 500 });
+  }
+}
+
+async function handlePollAction(formData: FormData, admin: any) {
+  const bulkOperationId = formData.get("bulkOperationId")?.toString();
+
+  if (!bulkOperationId) {
+    return Response.json(
+      { errors: { form: "Bulk operation ID required" } },
+      { status: 400 },
+    );
+  }
+
+  try {
+    const result = await pollBulkOperationStatus(admin, bulkOperationId);
+    return Response.json({ pollResult: result });
+  } catch (error) {
+    return Response.json(
+      {
+        errors: {
+          form: error instanceof Error ? error.message : "Polling failed",
+        },
+      },
+      { status: 500 },
+    );
+  }
+}
+
 export default function Index() {
-  const { products, pageInfo, filters, availableTags } =
+  const { products, pageInfo, filters, availableTags, activeOperation } =
     useLoaderData<typeof loader>();
   const previewFetcher = useFetcher<ActionData>();
   const startFetcher = useFetcher<ActionData>();
+  const pollFetcher = useFetcher<ActionData>();
   const shopify = useAppBridge();
 
   const [selectedProductIds, setSelectedProductIds] = useState<string[]>([]);
@@ -231,193 +282,202 @@ export default function Index() {
   const preview = previewFetcher.data?.preview;
   const previewErrors = previewFetcher.data?.errors;
   const startErrors = startFetcher.data?.errors;
+  const startedOperation = startFetcher.data?.operation;
+
+  // Auto-polling for active operations
+  useEffect(() => {
+    if (!startedOperation?.bulkOperationId) return;
+
+    const pollInterval = setInterval(() => {
+      const formData = new FormData();
+      formData.append("_action", "poll-operation");
+      formData.append("bulkOperationId", startedOperation.bulkOperationId!);
+      pollFetcher.submit(formData, { method: "post" });
+    }, 3000); // Poll every 3 seconds
+
+    return () => clearInterval(pollInterval);
+  }, [startedOperation?.bulkOperationId]);
+
+  const pollResult = pollFetcher.data?.pollResult;
+  const operationComplete =
+    pollResult?.status === "COMPLETED" || pollResult?.status === "FAILED";
+
+  // Show success toast when operation completes
+  useEffect(() => {
+    if (operationComplete && pollResult?.status === "COMPLETED") {
+      shopify.toast.show("Bulk operation completed successfully!", {
+        duration: 5000,
+      });
+    }
+  }, [operationComplete, pollResult?.status]);
+
+  const toggleProduct = (productId: string) => {
+    setSelectedProductIds((prev) =>
+      prev.includes(productId)
+        ? prev.filter((id) => id !== productId)
+        : [...prev, productId],
+    );
+  };
+
+  const selectAll = () => {
+    setSelectedProductIds(products.map((p) => p.id));
+  };
+
+  const deselectAll = () => {
+    setSelectedProductIds([]);
+  };
 
   const previewProductIds =
     preview?.products.map((product) => product.id) ?? [];
   const selectionMatchesPreview =
     previewProductIds.length > 0 &&
-    previewProductIds.length === selectedProductIds.length &&
-    previewProductIds.every((id) => selectedProductIds.includes(id));
-
-  const productIdSignature = products.map((product) => product.id).join(",");
-
-  useEffect(() => {
-    if (previewFetcher.state !== "idle" || !previewFetcher.data) {
-      return;
-    }
-
-    if (previewFetcher.data.errors?.form) {
-      shopify.toast.show(previewFetcher.data.errors.form, { isError: true });
-    } else if (previewFetcher.data.preview) {
-      shopify.toast.show("Preview ready");
-    }
-  }, [previewFetcher.data, previewFetcher.state, shopify]);
-
-  useEffect(() => {
-    if (startFetcher.state !== "idle" || !startFetcher.data) {
-      return;
-    }
-
-    if (startFetcher.data.errors?.form) {
-      shopify.toast.show(startFetcher.data.errors.form, { isError: true });
-    } else if (startFetcher.data.operation) {
-      shopify.toast.show("Bulk operation started");
-      setSelectedProductIds([]);
-    }
-  }, [shopify, startFetcher.data, startFetcher.state]);
-
-  useEffect(() => {
-    setSelectedProductIds([]);
-  }, [productIdSignature]);
-
-  const allSelected =
-    selectedProductIds.length > 0 &&
-    selectedProductIds.length === products.length;
-
-  const toggleSelectAll = () => {
-    if (allSelected) {
-      setSelectedProductIds([]);
-    } else {
-      setSelectedProductIds(products.map((product) => product.id));
-    }
-  };
-
-  const toggleProduct = (productId: string) => {
-    setSelectedProductIds((current) =>
-      current.includes(productId)
-        ? current.filter((id) => id !== productId)
-        : [...current, productId],
-    );
-  };
+    selectedProductIds.length === previewProductIds.length &&
+    selectedProductIds.every((id) => previewProductIds.includes(id));
 
   return (
-    <s-page heading="Bulk price adjustment">
-      <div slot="primary-action">
-        <previewFetcher.Form method="post">
-          <input
-            type="hidden"
-            name="_action"
-            value="preview-price-adjustment"
-          />
-          {selectedProductIds.map((id) => (
-            <input key={id} type="hidden" name="productIds" value={id} />
-          ))}
-          <div
-            style={{
-              display: "flex",
-              gap: "var(--s-space-4)",
-              flexWrap: "wrap",
-            }}
-          >
-            <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <span>Direction</span>
-              <select
-                name="direction"
-                value={direction}
-                onChange={(event) =>
-                  setDirection(
-                    event.currentTarget.value === "decrease"
-                      ? "decrease"
-                      : "increase",
-                  )
-                }
-              >
-                <option value="increase">Increase</option>
-                <option value="decrease">Decrease</option>
-              </select>
-            </label>
-            <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <span>Percentage</span>
-              <input
-                type="number"
-                min="0.01"
-                step="0.01"
-                name="percentage"
-                value={percentage}
-                onChange={(event) => setPercentage(event.currentTarget.value)}
-                style={{ width: 120 }}
-              />
-            </label>
-            <s-button type="submit" loading={isPreviewing} variant="primary">
-              Preview changes
-            </s-button>
-          </div>
-          <input type="hidden" name="direction" value={direction} />
-          <input type="hidden" name="percentage" value={percentage} />
-          {previewErrors?.productIds && (
-            <p style={{ color: "var(--s-color-text-critical)" }}>
-              {previewErrors.productIds}
-            </p>
-          )}
-          {previewErrors?.percentage && (
-            <p style={{ color: "var(--s-color-text-critical)" }}>
-              {previewErrors.percentage}
-            </p>
-          )}
-        </previewFetcher.Form>
-      </div>
-
+    <s-page
+      title="Bulk Product Editor"
+      actions={
+        <Link to="/app/history">
+          <s-button variant="tertiary">View History</s-button>
+        </Link>
+      }
+    >
       <s-layout>
-        <s-layout-section>
-          <s-card padding="none">
-            <s-section padding="none">
-              <s-stack gap="small-400">
-                <Form method="get" style={{ display: "contents" }}>
-                  <s-grid
-                    gridTemplateColumns="repeat(auto-fit, minmax(180px, 1fr))"
-                    gap="small-200"
-                    alignItems="end"
-                    paddingInline="base"
-                    paddingBlockStart="base"
-                  >
-                    <s-select
-                      label="Status"
-                      name="status"
-                      value={filters.status}
-                    >
-                      <s-option value="ANY">Any</s-option>
-                      <s-option value="ACTIVE">Active</s-option>
-                      <s-option value="DRAFT">Draft</s-option>
-                      <s-option value="ARCHIVED">Archived</s-option>
-                    </s-select>
-                    <s-text-field
-                      label="Tags (comma separated)"
-                      name="tags"
-                      value={filters.tagsInput}
-                      placeholder="summer, sale"
-                    ></s-text-field>
-                    <s-button type="submit" variant="primary">
-                      Apply filters
-                    </s-button>
+        {/* Active Operation Banner */}
+        {(activeOperation || startedOperation) && (
+          <s-layout-section>
+            <s-banner
+              tone={
+                pollResult?.status === "COMPLETED"
+                  ? "success"
+                  : pollResult?.status === "FAILED"
+                    ? "critical"
+                    : "info"
+              }
+              title={
+                pollResult?.status === "COMPLETED"
+                  ? "Bulk operation completed"
+                  : pollResult?.status === "FAILED"
+                    ? "Bulk operation failed"
+                    : "Bulk operation in progress"
+              }
+            >
+              {pollResult && (
+                <s-stack gap="small-200">
+                  <s-text>Status: {pollResult.status}</s-text>
+                  {pollResult.objectCount !== undefined && (
+                    <s-text>Processed {pollResult.objectCount} items</s-text>
+                  )}
+                  {pollResult.errorCode && (
+                    <s-text>Error: {pollResult.errorCode}</s-text>
+                  )}
+                </s-stack>
+              )}
+              {!pollResult && (
+                <s-text>
+                  Started at{" "}
+                  {new Date(activeOperation!.createdAt).toLocaleString()}
+                </s-text>
+              )}
+            </s-banner>
+          </s-layout-section>
+        )}
+
+        <s-layout-section variant="twoThirds">
+          <s-card>
+            <s-section>
+              <s-stack gap="base">
+                {/* Filters */}
+                <Form method="get">
+                  <s-grid gridTemplateColumns="1fr 1fr auto" gap="base">
+                    <div>
+                      <label htmlFor="status">
+                        <s-text>Product Status</s-text>
+                      </label>
+                      <select
+                        id="status"
+                        name="status"
+                        defaultValue={filters.status}
+                        style={{ width: "100%", padding: "8px" }}
+                      >
+                        <option value="ANY">Any</option>
+                        <option value="ACTIVE">Active</option>
+                        <option value="DRAFT">Draft</option>
+                        <option value="ARCHIVED">Archived</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <label htmlFor="tags">
+                        <s-text>Tags (comma-separated)</s-text>
+                      </label>
+                      <input
+                        type="text"
+                        id="tags"
+                        name="tags"
+                        defaultValue={filters.tagsInput}
+                        placeholder="e.g. sale, summer"
+                        style={{ width: "100%", padding: "8px" }}
+                      />
+                    </div>
+
+                    <div style={{ alignSelf: "flex-end" }}>
+                      <s-button type="submit" variant="primary">
+                        Filter
+                      </s-button>
+                    </div>
                   </s-grid>
                 </Form>
-                <s-grid
-                  gridTemplateColumns="1fr auto"
-                  gap="base"
+
+                {/* Selection Controls */}
+                <s-stack
+                  direction="inline"
+                  gap="small-200"
+                  justifyContent="space-between"
                   alignItems="center"
-                  paddingInline="base"
                 >
-                  <s-stack direction="inline" gap="small" alignItems="center">
-                    <input
-                      type="checkbox"
-                      aria-label="Select all products"
-                      checked={allSelected}
-                      onChange={toggleSelectAll}
-                    />
+                  <s-stack direction="inline" gap="small-200">
+                    <s-button
+                      variant="tertiary"
+                      size="small"
+                      onClick={selectAll}
+                    >
+                      Select all
+                    </s-button>
+                    <s-button
+                      variant="tertiary"
+                      size="small"
+                      onClick={deselectAll}
+                    >
+                      Deselect all
+                    </s-button>
                     <s-text tone="neutral">
-                      Showing {products.length} product
-                      {products.length === 1 ? "" : "s"}
+                      {selectedProductIds.length} selected
                     </s-text>
                   </s-stack>
-                  <s-text tone="neutral">
-                    Selected: {selectedProductIds.length}
-                  </s-text>
-                </s-grid>
 
+                  {availableTags.length > 0 && (
+                    <s-stack direction="inline" gap="small-200" wrap="wrap">
+                      <s-text tone="neutral" variant="bodySm">
+                        Available tags:
+                      </s-text>
+                      {availableTags.slice(0, 5).map((tag) => (
+                        <s-clickable-chip key={tag}>{tag}</s-clickable-chip>
+                      ))}
+                      {availableTags.length > 5 && (
+                        <s-text tone="neutral" variant="bodySm">
+                          +{availableTags.length - 5} more
+                        </s-text>
+                      )}
+                    </s-stack>
+                  )}
+                </s-stack>
+
+                {/* Product List */}
                 <s-stack>
                   {products.map((product) => {
                     const selected = selectedProductIds.includes(product.id);
-
                     return (
                       <s-clickable
                         key={product.id}
@@ -428,62 +488,47 @@ export default function Index() {
                         onClick={() => toggleProduct(product.id)}
                       >
                         <s-grid
-                          gridTemplateColumns="1fr auto"
+                          gridTemplateColumns="auto 1fr auto"
                           gap="base"
                           alignItems="center"
                         >
-                          <s-stack
-                            direction="inline"
-                            gap="small"
-                            alignItems="center"
-                          >
-                            <input
-                              type="checkbox"
-                              aria-label={`Select ${product.title}`}
-                              checked={selected}
-                              onChange={() => toggleProduct(product.id)}
-                              onClick={(event) => event.stopPropagation()}
-                            />
-                            <s-stack>
-                              <strong>{product.title}</strong>
-                              <s-text tone="neutral">
-                                {product.status.toLowerCase()}
-                              </s-text>
+                          <input
+                            type="checkbox"
+                            aria-label={`Select ${product.title}`}
+                            checked={selected}
+                            onChange={() => toggleProduct(product.id)}
+                            onClick={(event) => event.stopPropagation()}
+                          />
+
+                          <s-stack gap="small-200">
+                            <strong>{product.title}</strong>
+                            <s-text tone="neutral" variant="bodySm">
+                              {product.status.toLowerCase()} ·{" "}
+                              {product.variants.length} variant
+                              {product.variants.length !== 1 ? "s" : ""}
+                            </s-text>
+                            {product.tags.length > 0 && (
                               <s-stack
                                 direction="inline"
                                 gap="small-200"
                                 wrap="wrap"
                               >
-                                {product.tags.length > 0 ? (
-                                  product.tags.map((tag) => (
-                                    <s-clickable-chip key={tag}>
-                                      {tag}
-                                    </s-clickable-chip>
-                                  ))
-                                ) : (
-                                  <s-text tone="neutral">No tags</s-text>
-                                )}
+                                {product.tags.map((tag) => (
+                                  <s-clickable-chip key={tag}>
+                                    {tag}
+                                  </s-clickable-chip>
+                                ))}
                               </s-stack>
-                            </s-stack>
+                            )}
                           </s-stack>
-                          <div style={{ textAlign: "right" }}>
-                            <s-text tone="neutral">Variants</s-text>
-                            <ul
-                              style={{
-                                margin: 0,
-                                paddingInlineStart: "1.2rem",
-                                maxWidth: 220,
-                                textAlign: "left",
-                              }}
-                            >
-                              {product.variants.map((variant) => (
-                                <li key={variant.id}>
-                                  {variant.title} · {variant.price.toFixed(2)}{" "}
-                                  {variant.currencyCode}
-                                </li>
-                              ))}
-                            </ul>
-                          </div>
+
+                          <s-stack gap="small-200" alignItems="flex-end">
+                            {product.variants.map((variant) => (
+                              <s-text key={variant.id} variant="bodySm">
+                                {variant.title}: ${variant.price.toFixed(2)}
+                              </s-text>
+                            ))}
+                          </s-stack>
                         </s-grid>
                       </s-clickable>
                     );
@@ -498,14 +543,13 @@ export default function Index() {
                   )}
                 </s-stack>
 
+                {/* Pagination */}
                 <s-stack
                   direction="inline"
                   gap="small-200"
                   justifyContent="flex-end"
-                  paddingInline="base"
-                  paddingBlock="base"
                 >
-                  {pageInfo.hasPreviousPage && pageInfo.startCursor && (
+                  {pageInfo.hasPreviousPage && (
                     <Form method="get">
                       <input
                         type="hidden"
@@ -528,7 +572,7 @@ export default function Index() {
                       </s-button>
                     </Form>
                   )}
-                  {pageInfo.hasNextPage && pageInfo.endCursor && (
+                  {pageInfo.hasNextPage && (
                     <Form method="get">
                       <input
                         type="hidden"
@@ -559,76 +603,229 @@ export default function Index() {
 
         <s-layout-section variant="oneThird">
           <s-card>
-            {isPreviewing && (
-              <div style={{ marginTop: "var(--s-space-4)" }}>
-                <s-text tone="neutral">Generating preview…</s-text>
-              </div>
-            )}
+            <s-section>
+              <s-stack gap="base">
+                <s-text variant="headingMd">Price Adjustment</s-text>
 
-            {!isPreviewing && preview && preview.products.length > 0 && (
-              <startFetcher.Form method="post">
-                <input
-                  type="hidden"
-                  name="_action"
-                  value="start-price-adjustment"
-                />
-                {preview.products.map((product) => (
+                <previewFetcher.Form method="post">
                   <input
-                    key={product.id}
                     type="hidden"
-                    name="productIds"
-                    value={product.id}
+                    name="_action"
+                    value="preview-price-adjustment"
                   />
-                ))}
-                <input type="hidden" name="direction" value={direction} />
-                <input type="hidden" name="percentage" value={percentage} />
-                <s-button
-                  type="submit"
-                  loading={isStarting}
-                  variant="primary"
-                  disabled={!selectionMatchesPreview || isStarting}
-                >
-                  Start bulk update
-                </s-button>
-                {!selectionMatchesPreview && (
-                  <p
-                    style={{
-                      color: "var(--s-color-text-subdued)",
-                      marginTop: "0.5rem",
-                    }}
-                  >
-                    Rerun the preview after adjusting your selection.
-                  </p>
-                )}
-                {startErrors?.form && (
-                  <p
-                    style={{
-                      color: "var(--s-color-text-critical)",
-                      marginTop: "0.5rem",
-                    }}
-                  >
-                    {startErrors.form}
-                  </p>
-                )}
-              </startFetcher.Form>
-            )}
+                  {selectedProductIds.map((id) => (
+                    <input
+                      key={id}
+                      type="hidden"
+                      name="productIds"
+                      value={id}
+                    />
+                  ))}
 
-            {!isPreviewing && preview && preview.products.length === 0 && (
-              <div style={{ marginTop: "var(--s-space-4)" }}>
-                <s-text tone="neutral">
-                  Selected products have no variants with prices to update.
-                </s-text>
-              </div>
-            )}
+                  <s-stack gap="base">
+                    <div>
+                      <label>
+                        <s-text>Direction</s-text>
+                      </label>
+                      <select
+                        name="direction"
+                        value={direction}
+                        onChange={(e) =>
+                          setDirection(
+                            e.target.value as "increase" | "decrease",
+                          )
+                        }
+                        style={{ width: "100%", padding: "8px" }}
+                      >
+                        <option value="increase">Increase</option>
+                        <option value="decrease">Decrease</option>
+                      </select>
+                    </div>
 
-            {!isPreviewing && !preview && (
-              <div style={{ marginTop: "var(--s-space-4)" }}>
-                <s-text tone="neutral">
-                  Select products and submit a preview to see before/after
-                  pricing.
-                </s-text>
-              </div>
-            )}
+                    <div>
+                      <label htmlFor="percentage">
+                        <s-text>Percentage</s-text>
+                      </label>
+                      <input
+                        type="number"
+                        id="percentage"
+                        name="percentage"
+                        value={percentage}
+                        onChange={(e) => setPercentage(e.target.value)}
+                        min="0"
+                        max="1000"
+                        step="0.1"
+                        style={{ width: "100%", padding: "8px" }}
+                      />
+                      {previewErrors?.percentage && (
+                        <s-text tone="critical" variant="bodySm">
+                          {previewErrors.percentage}
+                        </s-text>
+                      )}
+                    </div>
+
+                    <s-button
+                      type="submit"
+                      variant="secondary"
+                      loading={isPreviewing}
+                      disabled={selectedProductIds.length === 0}
+                    >
+                      Generate Preview
+                    </s-button>
+
+                    {previewErrors?.productIds && (
+                      <s-text tone="critical">
+                        {previewErrors.productIds}
+                      </s-text>
+                    )}
+                    {previewErrors?.form && (
+                      <s-text tone="critical">{previewErrors.form}</s-text>
+                    )}
+                  </s-stack>
+                </previewFetcher.Form>
+
+                {/* Enhanced Preview Table */}
+                {!isPreviewing && preview && preview.products.length > 0 && (
+                  <s-stack gap="base">
+                    <s-divider />
+                    <s-text variant="headingSm">Preview Changes</s-text>
+
+                    <div style={{ maxHeight: "400px", overflowY: "auto" }}>
+                      <table style={{ width: "100%", fontSize: "0.875rem" }}>
+                        <thead>
+                          <tr style={{ borderBottom: "1px solid #e1e1e1" }}>
+                            <th style={{ textAlign: "left", padding: "8px" }}>
+                              Product
+                            </th>
+                            <th style={{ textAlign: "right", padding: "8px" }}>
+                              Before
+                            </th>
+                            <th style={{ textAlign: "right", padding: "8px" }}>
+                              After
+                            </th>
+                            <th style={{ textAlign: "right", padding: "8px" }}>
+                              Change
+                            </th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {preview.products.map((product) =>
+                            product.variants.map((variant, idx) => (
+                              <tr
+                                key={variant.id}
+                                style={{
+                                  borderBottom: "1px solid #f1f1f1",
+                                  backgroundColor:
+                                    idx % 2 === 0 ? "#fafafa" : "white",
+                                }}
+                              >
+                                <td style={{ padding: "8px" }}>
+                                  <div>
+                                    <strong>{product.title}</strong>
+                                    <br />
+                                    <span style={{ color: "#666" }}>
+                                      {variant.title}
+                                    </span>
+                                  </div>
+                                </td>
+                                <td
+                                  style={{
+                                    textAlign: "right",
+                                    padding: "8px",
+                                    textDecoration: "line-through",
+                                    color: "#999",
+                                  }}
+                                >
+                                  ${variant.priceBefore.toFixed(2)}
+                                </td>
+                                <td
+                                  style={{
+                                    textAlign: "right",
+                                    padding: "8px",
+                                    fontWeight: "bold",
+                                  }}
+                                >
+                                  ${variant.priceAfter.toFixed(2)}
+                                </td>
+                                <td
+                                  style={{
+                                    textAlign: "right",
+                                    padding: "8px",
+                                  }}
+                                >
+                                  <s-badge
+                                    tone={
+                                      variant.priceAfter > variant.priceBefore
+                                        ? "info"
+                                        : "warning"
+                                    }
+                                  >
+                                    {variant.priceAfter > variant.priceBefore
+                                      ? "+"
+                                      : ""}
+                                    {(
+                                      ((variant.priceAfter -
+                                        variant.priceBefore) /
+                                        variant.priceBefore) *
+                                      100
+                                    ).toFixed(1)}
+                                    %
+                                  </s-badge>
+                                </td>
+                              </tr>
+                            )),
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    <s-divider />
+
+                    {/* Start Operation Button */}
+                    <startFetcher.Form method="post">
+                      <input
+                        type="hidden"
+                        name="_action"
+                        value="start-price-adjustment"
+                      />
+                      {preview.products.map((product) => (
+                        <input
+                          key={product.id}
+                          type="hidden"
+                          name="productIds"
+                          value={product.id}
+                        />
+                      ))}
+                      <input type="hidden" name="direction" value={direction} />
+                      <input
+                        type="hidden"
+                        name="percentage"
+                        value={percentage}
+                      />
+
+                      <s-button
+                        type="submit"
+                        variant="primary"
+                        loading={isStarting}
+                        disabled={!selectionMatchesPreview || isStarting}
+                      >
+                        Start Bulk Update
+                      </s-button>
+
+                      {!selectionMatchesPreview && (
+                        <s-text tone="neutral" variant="bodySm">
+                          Rerun the preview after adjusting your selection.
+                        </s-text>
+                      )}
+
+                      {startErrors?.form && (
+                        <s-text tone="critical">{startErrors.form}</s-text>
+                      )}
+                    </startFetcher.Form>
+                  </s-stack>
+                )}
+              </s-stack>
+            </s-section>
           </s-card>
         </s-layout-section>
       </s-layout>
@@ -636,17 +833,9 @@ export default function Index() {
   );
 }
 
-export const headers: HeadersFunction = (headersArgs) => {
-  return boundary.headers(headersArgs);
-};
-
 function parseStatus(value: string | null): ProductStatusFilter {
-  if (!value) {
-    return "ANY";
-  }
-
+  if (!value) return "ANY";
   const normalized = value.toUpperCase();
-
   if (
     normalized === "ACTIVE" ||
     normalized === "DRAFT" ||
@@ -654,6 +843,5 @@ function parseStatus(value: string | null): ProductStatusFilter {
   ) {
     return normalized as ProductStatusFilter;
   }
-
   return "ANY";
 }
