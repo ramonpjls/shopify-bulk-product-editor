@@ -8,6 +8,7 @@ import type {
 } from "react-router";
 import { Form, useFetcher, useLoaderData } from "react-router";
 
+import { startPriceAdjustmentBulkOperation } from "../services/bulk-operations.server";
 import {
   buildPriceAdjustmentPreview,
   fetchProductList,
@@ -34,6 +35,10 @@ type LoaderData = {
 
 type ActionData = {
   preview?: PricePreviewResult;
+  operation?: {
+    id: string;
+    status: string;
+  };
   errors?: {
     productIds?: string;
     percentage?: string;
@@ -76,7 +81,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { admin } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   const formData = await request.formData();
   const intent = formData.get("_action");
 
@@ -120,6 +125,79 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
   }
 
+  if (intent === "start-price-adjustment") {
+    const productIds = formData
+      .getAll("productIds")
+      .map(String)
+      .filter(Boolean);
+    const direction =
+      formData.get("direction") === "decrease" ? "decrease" : "increase";
+    const percentageValue = Number(formData.get("percentage"));
+
+    const errors: ActionData["errors"] = {};
+
+    if (productIds.length === 0) {
+      errors.productIds =
+        "Select at least one product to start the bulk change.";
+    }
+
+    if (!Number.isFinite(percentageValue) || percentageValue <= 0) {
+      errors.percentage = "Enter a percentage greater than zero.";
+    } else if (percentageValue > 1000) {
+      errors.percentage = "Percentage is too large.";
+    }
+
+    if (errors.productIds || errors.percentage) {
+      return Response.json({ errors }, { status: 400 });
+    }
+
+    const shop = session?.shop;
+    if (!shop) {
+      return Response.json(
+        { errors: { form: "Unable to determine shop for this session." } },
+        { status: 500 },
+      );
+    }
+
+    try {
+      const previewResult = await buildPriceAdjustmentPreview(
+        admin,
+        productIds,
+        {
+          direction,
+          percentage: percentageValue,
+        },
+      );
+
+      if (previewResult.products.length === 0) {
+        return Response.json(
+          {
+            errors: {
+              form: "Selected products do not have variants to update.",
+            },
+          },
+          { status: 400 },
+        );
+      }
+
+      const { operation } = await startPriceAdjustmentBulkOperation({
+        admin,
+        shop,
+        preview: previewResult,
+      });
+
+      return Response.json({
+        operation: { id: operation.id, status: operation.status },
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Failed to start the bulk operation. Please try again.";
+      return Response.json({ errors: { form: message } }, { status: 500 });
+    }
+  }
+
   return Response.json(
     {
       errors: {
@@ -133,7 +211,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 export default function Index() {
   const { products, pageInfo, filters, availableTags } =
     useLoaderData<typeof loader>();
-  const fetcher = useFetcher<ActionData>();
+  const previewFetcher = useFetcher<ActionData>();
+  const startFetcher = useFetcher<ActionData>();
   const shopify = useAppBridge();
 
   const [selectedProductIds, setSelectedProductIds] = useState<string[]>([]);
@@ -143,27 +222,53 @@ export default function Index() {
   const [percentage, setPercentage] = useState("10");
 
   const isPreviewing =
-    fetcher.state === "submitting" &&
-    fetcher.formData?.get("_action") === "preview-price-adjustment";
+    previewFetcher.state === "submitting" &&
+    previewFetcher.formData?.get("_action") === "preview-price-adjustment";
+  const isStarting =
+    startFetcher.state === "submitting" &&
+    startFetcher.formData?.get("_action") === "start-price-adjustment";
 
-  const preview = fetcher.data?.preview;
-  const actionErrors = fetcher.data?.errors;
+  const preview = previewFetcher.data?.preview;
+  const previewErrors = previewFetcher.data?.errors;
+  const startErrors = startFetcher.data?.errors;
+
+  const previewProductIds =
+    preview?.products.map((product) => product.id) ?? [];
+  const selectionMatchesPreview =
+    previewProductIds.length > 0 &&
+    previewProductIds.length === selectedProductIds.length &&
+    previewProductIds.every((id) => selectedProductIds.includes(id));
+
+  const productIdSignature = products.map((product) => product.id).join(",");
 
   useEffect(() => {
-    if (fetcher.state !== "idle" || !fetcher.data) {
+    if (previewFetcher.state !== "idle" || !previewFetcher.data) {
       return;
     }
 
-    if (fetcher.data.errors?.form) {
-      shopify.toast.show(fetcher.data.errors.form, { isError: true });
-    } else if (fetcher.data.preview) {
+    if (previewFetcher.data.errors?.form) {
+      shopify.toast.show(previewFetcher.data.errors.form, { isError: true });
+    } else if (previewFetcher.data.preview) {
       shopify.toast.show("Preview ready");
     }
-  }, [fetcher.data, fetcher.state, shopify]);
+  }, [previewFetcher.data, previewFetcher.state, shopify]);
+
+  useEffect(() => {
+    if (startFetcher.state !== "idle" || !startFetcher.data) {
+      return;
+    }
+
+    if (startFetcher.data.errors?.form) {
+      shopify.toast.show(startFetcher.data.errors.form, { isError: true });
+    } else if (startFetcher.data.operation) {
+      shopify.toast.show("Bulk operation started");
+      setSelectedProductIds([]);
+    }
+  }, [shopify, startFetcher.data, startFetcher.state]);
 
   useEffect(() => {
     setSelectedProductIds([]);
-  }, [products.map((product) => product.id).join(",")]);
+  }, [productIdSignature]);
 
   const allSelected =
     selectedProductIds.length > 0 &&
@@ -188,7 +293,7 @@ export default function Index() {
   return (
     <s-page heading="Bulk price adjustment">
       <div slot="primary-action">
-        <fetcher.Form method="post" replace>
+        <previewFetcher.Form method="post">
           <input
             type="hidden"
             name="_action"
@@ -239,266 +344,290 @@ export default function Index() {
           </div>
           <input type="hidden" name="direction" value={direction} />
           <input type="hidden" name="percentage" value={percentage} />
-          {actionErrors?.productIds && (
+          {previewErrors?.productIds && (
             <p style={{ color: "var(--s-color-text-critical)" }}>
-              {actionErrors.productIds}
+              {previewErrors.productIds}
             </p>
           )}
-          {actionErrors?.percentage && (
+          {previewErrors?.percentage && (
             <p style={{ color: "var(--s-color-text-critical)" }}>
-              {actionErrors.percentage}
+              {previewErrors.percentage}
             </p>
           )}
-        </fetcher.Form>
+        </previewFetcher.Form>
       </div>
 
       <s-layout>
         <s-layout-section>
-          <s-card>
-            <Form
-              method="get"
-              style={{
-                display: "flex",
-                gap: "var(--s-space-4)",
-                flexWrap: "wrap",
-              }}
-            >
-              <label
-                style={{ display: "flex", flexDirection: "column", gap: 4 }}
-              >
-                <span>Status</span>
-                <select name="status" defaultValue={filters.status}>
-                  <option value="ANY">Any</option>
-                  <option value="ACTIVE">Active</option>
-                  <option value="DRAFT">Draft</option>
-                  <option value="ARCHIVED">Archived</option>
-                </select>
-              </label>
+          <s-card padding="none">
+            <s-section padding="none">
+              <s-stack gap="small-400">
+                <Form method="get" style={{ display: "contents" }}>
+                  <s-grid
+                    gridTemplateColumns="repeat(auto-fit, minmax(180px, 1fr))"
+                    gap="small-200"
+                    alignItems="end"
+                    paddingInline="base"
+                    paddingBlockStart="base"
+                  >
+                    <s-select
+                      label="Status"
+                      name="status"
+                      value={filters.status}
+                    >
+                      <s-option value="ANY">Any</s-option>
+                      <s-option value="ACTIVE">Active</s-option>
+                      <s-option value="DRAFT">Draft</s-option>
+                      <s-option value="ARCHIVED">Archived</s-option>
+                    </s-select>
+                    <s-text-field
+                      label="Tags (comma separated)"
+                      name="tags"
+                      value={filters.tagsInput}
+                      placeholder="summer, sale"
+                    ></s-text-field>
+                    <s-button type="submit" variant="primary">
+                      Apply filters
+                    </s-button>
+                  </s-grid>
+                </Form>
+                <s-grid
+                  gridTemplateColumns="1fr auto"
+                  gap="base"
+                  alignItems="center"
+                  paddingInline="base"
+                >
+                  <s-stack direction="inline" gap="small" alignItems="center">
+                    <input
+                      type="checkbox"
+                      aria-label="Select all products"
+                      checked={allSelected}
+                      onChange={toggleSelectAll}
+                    />
+                    <s-text tone="neutral">
+                      Showing {products.length} product
+                      {products.length === 1 ? "" : "s"}
+                    </s-text>
+                  </s-stack>
+                  <s-text tone="neutral">
+                    Selected: {selectedProductIds.length}
+                  </s-text>
+                </s-grid>
 
-              <label
-                style={{
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: 4,
-                  minWidth: 240,
-                }}
-              >
-                <span>Tags (comma-separated)</span>
-                <input
-                  type="text"
-                  name="tags"
-                  defaultValue={filters.tagsInput}
-                  placeholder="summer, sale"
-                />
-              </label>
-
-              <div style={{ alignSelf: "flex-end" }}>
-                <s-button type="submit" variant="primary">
-                  Apply filters
-                </s-button>
-              </div>
-            </Form>
-
-            {availableTags.length > 0 && (
-              <s-box style={{ marginTop: "var(--s-space-4)" }}>
-                <s-text tone="neutral">
-                  Suggested tags: {availableTags.slice(0, 10).join(", ")}
-                  {availableTags.length > 10 ? " …" : ""}
-                </s-text>
-              </s-box>
-            )}
-
-            <div style={{ marginTop: "var(--s-space-5)", overflowX: "auto" }}>
-              <table className="product-table">
-                <thead>
-                  <tr>
-                    <th style={{ width: 40 }}>
-                      <input
-                        type="checkbox"
-                        aria-label="Select all products"
-                        checked={allSelected}
-                        onChange={toggleSelectAll}
-                      />
-                    </th>
-                    <th>Product</th>
-                    <th>Status</th>
-                    <th>Tags</th>
-                    <th>Variants (price)</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {products.map((product: ProductListItem) => {
+                <s-stack>
+                  {products.map((product) => {
                     const selected = selectedProductIds.includes(product.id);
 
                     return (
-                      <tr key={product.id}>
-                        <td>
-                          <input
-                            type="checkbox"
-                            aria-label={`Select ${product.title}`}
-                            checked={selected}
-                            onChange={() => toggleProduct(product.id)}
-                          />
-                        </td>
-                        <td>
-                          <strong>{product.title}</strong>
-                        </td>
-                        <td>{product.status.toLowerCase()}</td>
-                        <td>
-                          {product.tags.length ? product.tags.join(", ") : "—"}
-                        </td>
-                        <td>
-                          <ul
-                            style={{ margin: 0, paddingInlineStart: "1.2rem" }}
+                      <s-clickable
+                        key={product.id}
+                        borderStyle="solid none none none"
+                        border="base"
+                        paddingInline="base"
+                        paddingBlock="small"
+                        onClick={() => toggleProduct(product.id)}
+                      >
+                        <s-grid
+                          gridTemplateColumns="1fr auto"
+                          gap="base"
+                          alignItems="center"
+                        >
+                          <s-stack
+                            direction="inline"
+                            gap="small"
+                            alignItems="center"
                           >
-                            {product.variants.map((variant) => (
-                              <li key={variant.id}>
-                                {variant.title} · {variant.price.toFixed(2)}{" "}
-                                {variant.currencyCode}
-                              </li>
-                            ))}
-                          </ul>
-                        </td>
-                      </tr>
+                            <input
+                              type="checkbox"
+                              aria-label={`Select ${product.title}`}
+                              checked={selected}
+                              onChange={() => toggleProduct(product.id)}
+                              onClick={(event) => event.stopPropagation()}
+                            />
+                            <s-stack>
+                              <strong>{product.title}</strong>
+                              <s-text tone="neutral">
+                                {product.status.toLowerCase()}
+                              </s-text>
+                              <s-stack
+                                direction="inline"
+                                gap="small-200"
+                                wrap="wrap"
+                              >
+                                {product.tags.length > 0 ? (
+                                  product.tags.map((tag) => (
+                                    <s-clickable-chip key={tag}>
+                                      {tag}
+                                    </s-clickable-chip>
+                                  ))
+                                ) : (
+                                  <s-text tone="neutral">No tags</s-text>
+                                )}
+                              </s-stack>
+                            </s-stack>
+                          </s-stack>
+                          <div style={{ textAlign: "right" }}>
+                            <s-text tone="neutral">Variants</s-text>
+                            <ul
+                              style={{
+                                margin: 0,
+                                paddingInlineStart: "1.2rem",
+                                maxWidth: 220,
+                                textAlign: "left",
+                              }}
+                            >
+                              {product.variants.map((variant) => (
+                                <li key={variant.id}>
+                                  {variant.title} · {variant.price.toFixed(2)}{" "}
+                                  {variant.currencyCode}
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        </s-grid>
+                      </s-clickable>
                     );
                   })}
-                  {products.length === 0 && (
-                    <tr>
-                      <td colSpan={5}>
-                        <s-text tone="neutral">
-                          No products match your filters.
-                        </s-text>
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
 
-            <div
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                marginTop: "var(--s-space-5)",
-                flexWrap: "wrap",
-                gap: "var(--s-space-4)",
-              }}
-            >
-              <div>
-                <s-text tone="neutral">
-                  Selected products: {selectedProductIds.length}
-                </s-text>
-              </div>
-              <div style={{ display: "flex", gap: "var(--s-space-3)" }}>
-                {pageInfo.hasPreviousPage && pageInfo.startCursor && (
-                  <Form method="get">
-                    <input type="hidden" name="status" value={filters.status} />
-                    <input
-                      type="hidden"
-                      name="tags"
-                      value={filters.tagsInput}
-                    />
-                    <input
-                      type="hidden"
-                      name="cursor"
-                      value={pageInfo.startCursor}
-                    />
-                    <input type="hidden" name="direction" value="backward" />
-                    <s-button type="submit" variant="tertiary">
-                      Previous
-                    </s-button>
-                  </Form>
-                )}
-                {pageInfo.hasNextPage && pageInfo.endCursor && (
-                  <Form method="get">
-                    <input type="hidden" name="status" value={filters.status} />
-                    <input
-                      type="hidden"
-                      name="tags"
-                      value={filters.tagsInput}
-                    />
-                    <input
-                      type="hidden"
-                      name="cursor"
-                      value={pageInfo.endCursor}
-                    />
-                    <input type="hidden" name="direction" value="forward" />
-                    <s-button type="submit" variant="tertiary">
-                      Next
-                    </s-button>
-                  </Form>
-                )}
-              </div>
-            </div>
+                  {products.length === 0 && (
+                    <s-stack paddingInline="base" paddingBlock="base">
+                      <s-text tone="neutral">
+                        No products match your filters.
+                      </s-text>
+                    </s-stack>
+                  )}
+                </s-stack>
+
+                <s-stack
+                  direction="inline"
+                  gap="small-200"
+                  justifyContent="flex-end"
+                  paddingInline="base"
+                  paddingBlock="base"
+                >
+                  {pageInfo.hasPreviousPage && pageInfo.startCursor && (
+                    <Form method="get">
+                      <input
+                        type="hidden"
+                        name="status"
+                        value={filters.status}
+                      />
+                      <input
+                        type="hidden"
+                        name="tags"
+                        value={filters.tagsInput}
+                      />
+                      <input
+                        type="hidden"
+                        name="cursor"
+                        value={pageInfo.startCursor ?? ""}
+                      />
+                      <input type="hidden" name="direction" value="backward" />
+                      <s-button type="submit" variant="tertiary">
+                        Previous
+                      </s-button>
+                    </Form>
+                  )}
+                  {pageInfo.hasNextPage && pageInfo.endCursor && (
+                    <Form method="get">
+                      <input
+                        type="hidden"
+                        name="status"
+                        value={filters.status}
+                      />
+                      <input
+                        type="hidden"
+                        name="tags"
+                        value={filters.tagsInput}
+                      />
+                      <input
+                        type="hidden"
+                        name="cursor"
+                        value={pageInfo.endCursor ?? ""}
+                      />
+                      <input type="hidden" name="direction" value="forward" />
+                      <s-button type="submit" variant="tertiary">
+                        Next
+                      </s-button>
+                    </Form>
+                  )}
+                </s-stack>
+              </s-stack>
+            </s-section>
           </s-card>
         </s-layout-section>
 
         <s-layout-section variant="oneThird">
           <s-card>
-            <s-heading level={2}>Preview</s-heading>
             {isPreviewing && (
-              <s-box style={{ marginTop: "var(--s-space-4)" }}>
+              <div style={{ marginTop: "var(--s-space-4)" }}>
                 <s-text tone="neutral">Generating preview…</s-text>
-              </s-box>
-            )}
-
-            {!isPreviewing && preview && preview.products.length > 0 && (
-              <div
-                style={{
-                  marginTop: "var(--s-space-4)",
-                  display: "grid",
-                  gap: "var(--s-space-4)",
-                }}
-              >
-                {preview.products.map((product) => (
-                  <s-box
-                    key={product.id}
-                    padding="base"
-                    borderWidth="base"
-                    borderRadius="base"
-                    background="subdued"
-                  >
-                    <strong>{product.title}</strong>
-                    <ul
-                      style={{
-                        marginTop: "var(--s-space-3)",
-                        paddingInlineStart: "1.2rem",
-                      }}
-                    >
-                      {product.variants.map((variant) => (
-                        <li key={variant.id}>
-                          {variant.title}: {variant.priceBefore.toFixed(2)} →{" "}
-                          <strong>{variant.priceAfter.toFixed(2)}</strong>{" "}
-                          {variant.currencyCode}
-                        </li>
-                      ))}
-                    </ul>
-                  </s-box>
-                ))}
               </div>
             )}
 
+            {!isPreviewing && preview && preview.products.length > 0 && (
+              <startFetcher.Form method="post">
+                <input
+                  type="hidden"
+                  name="_action"
+                  value="start-price-adjustment"
+                />
+                {preview.products.map((product) => (
+                  <input
+                    key={product.id}
+                    type="hidden"
+                    name="productIds"
+                    value={product.id}
+                  />
+                ))}
+                <input type="hidden" name="direction" value={direction} />
+                <input type="hidden" name="percentage" value={percentage} />
+                <s-button
+                  type="submit"
+                  loading={isStarting}
+                  variant="primary"
+                  disabled={!selectionMatchesPreview || isStarting}
+                >
+                  Start bulk update
+                </s-button>
+                {!selectionMatchesPreview && (
+                  <p
+                    style={{
+                      color: "var(--s-color-text-subdued)",
+                      marginTop: "0.5rem",
+                    }}
+                  >
+                    Rerun the preview after adjusting your selection.
+                  </p>
+                )}
+                {startErrors?.form && (
+                  <p
+                    style={{
+                      color: "var(--s-color-text-critical)",
+                      marginTop: "0.5rem",
+                    }}
+                  >
+                    {startErrors.form}
+                  </p>
+                )}
+              </startFetcher.Form>
+            )}
+
             {!isPreviewing && preview && preview.products.length === 0 && (
-              <s-box style={{ marginTop: "var(--s-space-4)" }}>
+              <div style={{ marginTop: "var(--s-space-4)" }}>
                 <s-text tone="neutral">
                   Selected products have no variants with prices to update.
                 </s-text>
-              </s-box>
+              </div>
             )}
 
             {!isPreviewing && !preview && (
-              <s-box style={{ marginTop: "var(--s-space-4)" }}>
+              <div style={{ marginTop: "var(--s-space-4)" }}>
                 <s-text tone="neutral">
                   Select products and submit a preview to see before/after
                   pricing.
                 </s-text>
-              </s-box>
-            )}
-
-            {actionErrors?.form && (
-              <s-box style={{ marginTop: "var(--s-space-4)" }}>
-                <s-text tone="critical">{actionErrors.form}</s-text>
-              </s-box>
+              </div>
             )}
           </s-card>
         </s-layout-section>

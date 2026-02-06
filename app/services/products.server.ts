@@ -73,6 +73,9 @@ export type PricePreviewResult = {
 };
 
 type ProductsQueryResponse = {
+  shop?: {
+    currencyCode?: string;
+  };
   products: {
     edges: Array<{
       cursor: string;
@@ -86,12 +89,6 @@ type ProductsQueryResponse = {
             id: string;
             title: string;
             price?: string;
-            priceSet?: {
-              shopMoney?: {
-                amount: string;
-                currencyCode: string;
-              };
-            };
           }>;
         };
       };
@@ -106,6 +103,9 @@ type ProductsQueryResponse = {
 };
 
 type ProductsByIdResponse = {
+  shop?: {
+    currencyCode?: string;
+  };
   nodes: Array<
     | null
     | {
@@ -119,12 +119,6 @@ type ProductsByIdResponse = {
             id: string;
             title: string;
             price?: string;
-            priceSet?: {
-              shopMoney?: {
-                amount: string;
-                currencyCode: string;
-              };
-            };
           }>;
         };
       }
@@ -156,6 +150,7 @@ export async function fetchProductList(
     throw new Error(json.errors.map((error) => error.message).join("\n"));
   }
 
+  const currencyCode = json.data?.shop?.currencyCode ?? "";
   const products = json.data?.products.edges ?? [];
   const tagAccumulator = new Set<string>();
 
@@ -171,7 +166,8 @@ export async function fetchProductList(
       variants: node.variants.nodes.map((variant) => ({
         id: variant.id,
         title: variant.title,
-        ...extractVariantPricing(variant),
+        price: parseCurrencyAmount(variant.price),
+        currencyCode,
       })),
     };
   });
@@ -211,6 +207,7 @@ export async function buildPriceAdjustmentPreview(
   }
 
   const multiplier = calculateMultiplier(adjustment);
+  const currencyCode = json.data?.shop?.currencyCode ?? "";
 
   const products = (json.data?.nodes ?? [])
     .filter((node): node is NonNullable<ProductsByIdResponse["nodes"][number]> => {
@@ -223,8 +220,7 @@ export async function buildPriceAdjustmentPreview(
       tags: node.tags,
       variants: (node.variants?.nodes ?? [])
         .map((variant) => {
-          const pricing = extractVariantPricing(variant);
-          const priceBefore = pricing.price;
+          const priceBefore = parseCurrencyAmount(variant.price);
 
           if (Number.isNaN(priceBefore)) {
             return null;
@@ -237,7 +233,7 @@ export async function buildPriceAdjustmentPreview(
             title: variant.title,
             priceBefore,
             priceAfter,
-            currencyCode: pricing.currencyCode,
+            currencyCode,
           } satisfies PricePreviewVariant;
         })
         .filter(Boolean) as PricePreviewVariant[],
@@ -290,27 +286,13 @@ function escapeTag(tag: string): string {
   return tag.replace(/'/g, "\\'");
 }
 
-type VariantPricingSource = {
-  price?: string;
-  priceSet?: {
-    shopMoney?: {
-      amount: string;
-      currencyCode: string;
-    };
-  };
-};
+function parseCurrencyAmount(amount?: string): number {
+  if (!amount) {
+    return 0;
+  }
 
-function extractVariantPricing(variant: VariantPricingSource): {
-  price: number;
-  currencyCode: string;
-} {
-  const shopMoney = variant.priceSet?.shopMoney;
-  const amountSource = shopMoney?.amount ?? variant.price ?? "0";
-  const parsed = parseFloat(amountSource);
-  const price = Number.isNaN(parsed) ? 0 : parsed;
-  const currencyCode = shopMoney?.currencyCode ?? "UNKNOWN";
-
-  return { price, currencyCode };
+  const parsed = parseFloat(amount);
+  return Number.isNaN(parsed) ? 0 : parsed;
 }
 
 type GraphQLResponse<T> = {
@@ -328,6 +310,9 @@ const PRODUCTS_QUERY = `#graphql
     $after: String
     $before: String
   ) {
+    shop {
+      currencyCode
+    }
     products(query: $query, first: $first, last: $last, after: $after, before: $before) {
       edges {
         cursor
@@ -341,12 +326,6 @@ const PRODUCTS_QUERY = `#graphql
               id
               title
               price
-              priceSet {
-                shopMoney {
-                  amount
-                  currencyCode
-                }
-              }
             }
           }
         }
@@ -363,6 +342,9 @@ const PRODUCTS_QUERY = `#graphql
 
 const PRODUCTS_BY_ID_QUERY = `#graphql
   query ProductsById($ids: [ID!]!) {
+    shop {
+      currencyCode
+    }
     nodes(ids: $ids) {
       __typename
       ... on Product {
@@ -375,12 +357,6 @@ const PRODUCTS_BY_ID_QUERY = `#graphql
             id
             title
             price
-            priceSet {
-              shopMoney {
-                amount
-                currencyCode
-              }
-            }
           }
         }
       }
