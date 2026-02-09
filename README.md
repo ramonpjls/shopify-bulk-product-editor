@@ -155,35 +155,27 @@ User Selection → Preview → Confirmation → Bulk Operation → Polling → R
 
 ### Installation
 
-1. **Clone and install dependencies**
+```bash
+# 1. Clone repository
+git clone 
+cd bulk-product-editor
 
-   ```bash
-   git clone <repository>
-   cd bulk-product-editor
-   npm install
-   ```
+# 2. Install dependencies
+npm install
 
-2. **Configure environment**
+# 3. Setup database
+npm run setup
 
-   ```bash
-   cp .env.example .env
-   # Edit .env with your Shopify credentials
-   ```
+# 4. Start development server
+npm run dev
+```
 
-3. **Setup database**
-   ```bash
-   npm run setup
-   ```
+### First-Time Setup
 
-4. **Start development server**
-
-   ```bash
-   npm run dev
-   ```
-
-5. **Install app on development store**
-   - Follow Shopify CLI prompts
-   - Grant required permissions (`write_products`)
+1. **Create Shopify Partner Account**: https://partners.shopify.com
+2. **Create Development Store**: Partners Dashboard → Stores → Add store
+3. **Install App**: Follow Shopify CLI prompts during `npm run dev`
+4. **Grant Permissions**: Accept `write_products` scope
 
 ---
 
