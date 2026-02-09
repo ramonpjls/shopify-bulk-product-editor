@@ -68,9 +68,25 @@ export async function action({ request }: ActionFunctionArgs) {
       errorMessage?: string;
       results?: BulkOperationResults;
     } = {
-      status: bulkStatus.status === "COMPLETED" ? "COMPLETED" : "FAILED",
+      status:
+        bulkStatus.status === "COMPLETED"
+          ? "COMPLETED"
+          : bulkStatus.status === "EXPIRED"
+            ? "EXPIRED"
+            : "FAILED",
       completedAt: new Date(bulkStatus.completedAt ?? payload.completed_at),
     };
+
+    // Handle EXPIRED status specifically
+    if (
+      bulkStatus.status === "EXPIRED" ||
+      bulkStatus.errorCode === "NOT_FOUND"
+    ) {
+      updates.status = "EXPIRED";
+      updates.errorMessage =
+        "Bulk operation expired or not found in Shopify. This can happen with old operations (>7 days).";
+      console.log(`⚠️ Marking operation ${operation.id} as EXPIRED`);
+    }
 
     // Download and process JSONL results
     if (bulkStatus.url && bulkStatus.status === "COMPLETED") {

@@ -72,6 +72,28 @@ export type PricePreviewResult = {
   adjustment: PriceAdjustment;
 };
 
+// Tag Update Types
+export type TagUpdateAction = "add" | "remove" | "replace";
+
+export type TagUpdate = {
+  action: TagUpdateAction;
+  tags: string[];
+  replaceTags?: string[];
+};
+
+export type TagPreviewProduct = {
+  id: string;
+  title: string;
+  status: string;
+  tagsBefore: string[];
+  tagsAfter: string[];
+};
+
+export type TagPreviewResult = {
+  products: TagPreviewProduct[];
+  update: TagUpdate;
+};
+
 type ProductsQueryResponse = {
   shop?: {
     currencyCode?: string;
@@ -109,19 +131,19 @@ type ProductsByIdResponse = {
   nodes: Array<
     | null
     | {
-        __typename: string;
-        id: string;
-        title: string;
-        status: string;
-        tags: string[];
-        variants?: {
-          nodes: Array<{
-            id: string;
-            title: string;
-            price?: string;
-          }>;
-        };
-      }
+      __typename: string;
+      id: string;
+      title: string;
+      status: string;
+      tags: string[];
+      variants?: {
+        nodes: Array<{
+          id: string;
+          title: string;
+          price?: string;
+        }>;
+      };
+    }
   >;
 };
 
@@ -243,6 +265,71 @@ export async function buildPriceAdjustmentPreview(
   return {
     products,
     adjustment,
+  };
+}
+
+/**
+ * Build a preview of tag updates for selected products
+ */
+export async function buildTagUpdatePreview(
+  admin: AdminApiClient,
+  productIds: string[],
+  update: TagUpdate
+): Promise<TagPreviewResult> {
+  if (!productIds.length) {
+    return {
+      products: [],
+      update,
+    };
+  }
+
+  const response = await admin.graphql(PRODUCTS_BY_ID_QUERY, {
+    variables: { ids: productIds },
+  });
+
+  const json = (await response.json()) as GraphQLResponse<ProductsByIdResponse>;
+
+  if (json.errors?.length) {
+    throw new Error(json.errors.map((error) => error.message).join("\n"));
+  }
+
+  const products = (json.data?.nodes ?? [])
+    .filter((node): node is NonNullable<ProductsByIdResponse["nodes"][number]> => {
+      return Boolean(node && node.__typename === "Product");
+    })
+    .map((node) => {
+      const tagsBefore = node.tags;
+      let tagsAfter: string[];
+
+      switch (update.action) {
+        case "add":
+          // Add new tags, avoid duplicates
+          tagsAfter = [...new Set([...tagsBefore, ...update.tags])];
+          break;
+        case "remove":
+          // Remove specified tags
+          tagsAfter = tagsBefore.filter((tag) => !update.tags.includes(tag));
+          break;
+        case "replace":
+          // Replace all tags with new set
+          tagsAfter = update.replaceTags ?? update.tags;
+          break;
+        default:
+          tagsAfter = tagsBefore;
+      }
+
+      return {
+        id: node.id,
+        title: node.title,
+        status: node.status,
+        tagsBefore,
+        tagsAfter,
+      } satisfies TagPreviewProduct;
+    });
+
+  return {
+    products,
+    update,
   };
 }
 

@@ -8,15 +8,41 @@
  * - Filtering and pagination
  */
 
-import { useCallback, useState } from "react";
+import {
+  Badge,
+  Banner,
+  BlockStack,
+  Box,
+  Button,
+  Card,
+  Grid,
+  IndexTable,
+  InlineGrid,
+  Layout,
+  Modal,
+  Page,
+  Select,
+  Text,
+} from "@shopify/polaris";
+import { useCallback, useEffect, useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { Form, useLoaderData, useNavigation, useSubmit } from "react-router";
+import {
+  Form,
+  useActionData,
+  useLoaderData,
+  useNavigate,
+  useNavigation,
+  useSubmit,
+} from "react-router";
 import {
   findOperationsByShop,
   getOperationStats,
   type OperationRecord,
 } from "../models/operation.server";
-import { undoOperation } from "../services/bulk-operations.server";
+import {
+  undoOperation,
+  type PriceAdjustmentPayload,
+} from "../services/bulk-operations.server";
 import { authenticate } from "../shopify.server";
 
 type LoaderData = {
@@ -102,6 +128,7 @@ export async function action({ request }: ActionFunctionArgs) {
         operationId: result.operation.id,
       } satisfies ActionData);
     } catch (error) {
+      console.error("Undo failed:", error);
       return Response.json(
         {
           error:
@@ -121,10 +148,6 @@ export async function action({ request }: ActionFunctionArgs) {
         { status: 400 },
       );
     }
-
-    // Trigger a refresh by polling Shopify (webhook might have failed)
-    // Implementation would go here
-
     return Response.json({ success: true } satisfies ActionData);
   }
 
@@ -136,364 +159,364 @@ export async function action({ request }: ActionFunctionArgs) {
 export default function History() {
   const { operations, stats, filters, pagination } =
     useLoaderData<typeof loader>();
+  const actionData = useActionData<ActionData>();
   const submit = useSubmit();
+  const navigate = useNavigate();
   const navigation = useNavigation();
   const [selectedOperation, setSelectedOperation] = useState<string | null>(
     null,
   );
 
+  const [status, setStatus] = useState(filters.status || "");
+  const [type, setType] = useState(filters.type || "");
+
+  // Sync state with URL params when they change
+  useEffect(() => {
+    setStatus(filters.status || "");
+  }, [filters.status]);
+
+  useEffect(() => {
+    setType(filters.type || "");
+  }, [filters.type]);
+
+  const handleStatusChange = useCallback(
+    (value: string) => setStatus(value),
+    [],
+  );
+  const handleTypeChange = useCallback((value: string) => setType(value), []);
+
   const isUndoing =
     navigation.state === "submitting" &&
     navigation.formData?.get("intent") === "undo";
 
-  const handleUndo = useCallback(
-    (operationId: string) => {
-      if (
-        confirm(
-          "Are you sure you want to undo this operation? This will create a new bulk operation to revert the changes.",
-        )
-      ) {
-        setSelectedOperation(operationId);
-        const formData = new FormData();
-        formData.append("intent", "undo");
-        formData.append("operationId", operationId);
-        submit(formData, { method: "post" });
-      }
-    },
-    [submit],
-  );
+  const [undoModalOpen, setUndoModalOpen] = useState(false);
+  const [operationToUndo, setOperationToUndo] = useState<string | null>(null);
+
+  const handleUndoClick = useCallback((operationId: string) => {
+    setOperationToUndo(operationId);
+    setUndoModalOpen(true);
+  }, []);
+
+  const handleCloseModal = useCallback(() => {
+    setUndoModalOpen(false);
+    setOperationToUndo(null);
+  }, []);
+
+  const handleConfirmUndo = useCallback(() => {
+    if (operationToUndo) {
+      setSelectedOperation(operationToUndo);
+      const formData = new FormData();
+      formData.append("intent", "undo");
+      formData.append("operationId", operationToUndo);
+      submit(formData, { method: "post" });
+      setUndoModalOpen(false);
+      setOperationToUndo(null);
+    }
+  }, [operationToUndo, submit]);
 
   return (
-    <s-page title="Operation History">
-      <s-layout>
-        <s-layout-section>
+    <Page title="History">
+      <Layout>
+        <Layout.Section>
+          {actionData?.error && (
+            <Banner tone="critical" title="Error">
+              <p>{actionData.error}</p>
+            </Banner>
+          )}
           {/* Stats Cards */}
-          <s-grid gridTemplateColumns="repeat(4, 1fr)" gap="base">
-            <s-card>
-              <s-stack gap="small-200">
-                <s-text tone="neutral">Total Operations</s-text>
-                <s-text variant="headingLg">{stats.total}</s-text>
-              </s-stack>
-            </s-card>
-            <s-card>
-              <s-stack gap="small-200">
-                <s-text tone="neutral">Completed</s-text>
-                <s-text variant="headingLg" tone="success">
-                  {stats.completed}
-                </s-text>
-              </s-stack>
-            </s-card>
-            <s-card>
-              <s-stack gap="small-200">
-                <s-text tone="neutral">Failed</s-text>
-                <s-text variant="headingLg" tone="critical">
-                  {stats.failed}
-                </s-text>
-              </s-stack>
-            </s-card>
-            <s-card>
-              <s-stack gap="small-200">
-                <s-text tone="neutral">Running</s-text>
-                <s-text variant="headingLg" tone="info">
-                  {stats.running}
-                </s-text>
-              </s-stack>
-            </s-card>
-          </s-grid>
+          <Grid>
+            <Grid.Cell columnSpan={{ xs: 6, sm: 3, md: 3, lg: 3, xl: 3 }}>
+              <Card>
+                <BlockStack gap="200">
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "8px",
+                    }}
+                  >
+                    <s-icon type="check-circle-filled" />
+                    <Text as="h3" variant="headingSm" fontWeight="medium">
+                      Total Operations
+                    </Text>
+                  </div>
+                  <Text as="p" variant="bodyMd">
+                    {stats.total}
+                  </Text>
+                </BlockStack>
+              </Card>
+            </Grid.Cell>
+            <Grid.Cell columnSpan={{ xs: 6, sm: 3, md: 3, lg: 3, xl: 3 }}>
+              <Card>
+                <BlockStack gap="200">
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "8px",
+                    }}
+                  >
+                    <s-icon type="circle-dashed" />
+                    <Text as="h3" variant="headingSm" fontWeight="medium">
+                      Running
+                    </Text>
+                  </div>
+                  <Text as="p" variant="bodyMd">
+                    {stats.running}
+                  </Text>
+                </BlockStack>
+              </Card>
+            </Grid.Cell>
+            <Grid.Cell columnSpan={{ xs: 6, sm: 3, md: 3, lg: 3, xl: 3 }}>
+              <Card>
+                <BlockStack gap="200">
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "8px",
+                    }}
+                  >
+                    <s-icon type="check-circle" />
+                    <Text as="h3" variant="headingSm" fontWeight="medium">
+                      Completed
+                    </Text>
+                  </div>
+                  <Text as="p" variant="bodyMd">
+                    {stats.completed}
+                  </Text>
+                </BlockStack>
+              </Card>
+            </Grid.Cell>
+            <Grid.Cell columnSpan={{ xs: 6, sm: 3, md: 3, lg: 3, xl: 3 }}>
+              <Card>
+                <BlockStack gap="200">
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "8px",
+                    }}
+                  >
+                    <s-icon type="x-circle" />
+                    <Text as="h3" variant="headingSm" fontWeight="medium">
+                      Failed
+                    </Text>
+                  </div>
+                  <Text as="p" variant="bodyMd">
+                    {stats.failed}
+                  </Text>
+                </BlockStack>
+              </Card>
+            </Grid.Cell>
+          </Grid>
 
-          {/* Filters */}
-          <s-card>
-            <Form method="get">
-              <s-grid
-                gridTemplateColumns="1fr 1fr auto"
-                gap="base"
-                alignItems="end"
-              >
-                <div>
-                  <label htmlFor="status">
-                    <s-text>Status</s-text>
-                  </label>
-                  <select
-                    id="status"
+          <Box paddingBlockStart="400">
+            {/* Filters */}
+            <Card>
+              <Form method="get">
+                <InlineGrid columns={3} gap="400" alignItems="end">
+                  <Select
+                    label="Status"
                     name="status"
-                    defaultValue={filters.status || ""}
-                    style={{ width: "100%", padding: "8px" }}
-                  >
-                    <option value="">All Statuses</option>
-                    <option value="COMPLETED">Completed</option>
-                    <option value="RUNNING">Running</option>
-                    <option value="FAILED">Failed</option>
-                    <option value="CANCELED">Canceled</option>
-                  </select>
-                </div>
-
-                <div>
-                  <label htmlFor="type">
-                    <s-text>Type</s-text>
-                  </label>
-                  <select
-                    id="type"
+                    value={status}
+                    options={[
+                      { label: "All Statuses", value: "" },
+                      { label: "Completed", value: "COMPLETED" },
+                      { label: "Running", value: "RUNNING" },
+                      { label: "Failed", value: "FAILED" },
+                    ]}
+                    onChange={handleStatusChange}
+                  />
+                  <Select
+                    label="Type"
                     name="type"
-                    defaultValue={filters.type || ""}
-                    style={{ width: "100%", padding: "8px" }}
+                    value={type}
+                    options={[
+                      { label: "All Types", value: "" },
+                      { label: "Price Adjustment", value: "PRICE_ADJUSTMENT" },
+                      { label: "Tag Update", value: "TAG_UPDATE" },
+                      { label: "Status Change", value: "STATUS_CHANGE" },
+                    ]}
+                    onChange={handleTypeChange}
+                  />
+                  <Button submit variant="primary">
+                    Apply Filters
+                  </Button>
+                </InlineGrid>
+              </Form>
+            </Card>
+          </Box>
+
+          <Box paddingBlockStart="400">
+            {/* Operations Table */}
+            <Card padding="0">
+              <IndexTable
+                resourceName={{ singular: "operation", plural: "operations" }}
+                itemCount={operations.length}
+                selectable={false}
+                headings={[
+                  { title: "Date" },
+                  { title: "Description" },
+                  { title: "Status" },
+                  { title: "Products" },
+                  { title: "Results" },
+                  { title: "Actions" },
+                ]}
+                pagination={{
+                  hasNext: pagination.page < pagination.totalPages,
+                  hasPrevious: pagination.page > 1,
+                  onNext: () => {
+                    const params = new URLSearchParams(window.location.search);
+                    params.set("page", (pagination.page + 1).toString());
+                    navigate(`?${params.toString()}`);
+                  },
+                  onPrevious: () => {
+                    const params = new URLSearchParams(window.location.search);
+                    params.set("page", (pagination.page - 1).toString());
+                    navigate(`?${params.toString()}`);
+                  },
+                }}
+              >
+                {operations.map((operation, index) => (
+                  <IndexTable.Row
+                    id={operation.id}
+                    key={operation.id}
+                    position={index}
                   >
-                    <option value="">All Types</option>
-                    <option value="PRICE_ADJUSTMENT">Price Adjustment</option>
-                    <option value="TAG_UPDATE">Tag Update</option>
-                    <option value="STATUS_CHANGE">Status Change</option>
-                  </select>
-                </div>
+                    <IndexTable.Cell>
+                      <BlockStack gap="200">
+                        <Text as="span" variant="bodyMd" fontWeight="semibold">
+                          {formatDate(operation.createdAt)}
+                        </Text>
+                        {operation.completedAt && (
+                          <Text tone="subdued" variant="bodySm" as="span">
+                            Completed: {formatDate(operation.completedAt)}
+                          </Text>
+                        )}
+                      </BlockStack>
+                    </IndexTable.Cell>
+                    <IndexTable.Cell>
+                      <BlockStack gap="100">
+                        <Text as="span" variant="bodyMd" fontWeight="semibold">
+                          {formatOperationType(operation.type)}
+                        </Text>
+                        <Text tone="subdued" variant="bodySm" as="span">
+                          {getOperationDescription(operation)}
+                        </Text>
+                      </BlockStack>
+                    </IndexTable.Cell>
+                    <IndexTable.Cell>
+                      <StatusBadge
+                        status={operation.status}
+                        undone={operation.undone}
+                      />
+                    </IndexTable.Cell>
+                    <IndexTable.Cell>
+                      <ProductDetails operation={operation} />
+                    </IndexTable.Cell>
 
-                <s-button type="submit" variant="primary">
-                  Apply Filters
-                </s-button>
-              </s-grid>
-            </Form>
-          </s-card>
-
-          {/* Operations Table */}
-          <s-card>
-            <s-section>
-              <s-stack gap="base">
-                {operations.length === 0 ? (
-                  <s-stack
-                    paddingInline="base"
-                    paddingBlock="large"
-                    alignItems="center"
-                  >
-                    <s-text tone="neutral">No operations found.</s-text>
-                  </s-stack>
-                ) : (
-                  <s-stack>
-                    {/* Table Header */}
-                    <s-grid
-                      gridTemplateColumns="2fr 1fr 1fr 1fr 2fr 1fr"
-                      gap="base"
-                      paddingInline="base"
-                      paddingBlock="small"
-                      borderStyle="none none solid none"
-                      border="base"
-                    >
-                      <s-text variant="headingSm">Date</s-text>
-                      <s-text variant="headingSm">Type</s-text>
-                      <s-text variant="headingSm">Status</s-text>
-                      <s-text variant="headingSm">Items</s-text>
-                      <s-text variant="headingSm">Results</s-text>
-                      <s-text variant="headingSm">Actions</s-text>
-                    </s-grid>
-
-                    {/* Table Rows */}
-                    {operations.map((operation) => (
-                      <s-grid
-                        key={operation.id}
-                        gridTemplateColumns="2fr 1fr 1fr 1fr 2fr 1fr"
-                        gap="base"
-                        paddingInline="base"
-                        paddingBlock="small"
-                        borderStyle="none none solid none"
-                        border="base"
-                        alignItems="center"
-                      >
-                        {/* Date */}
-                        <s-stack gap="small-200">
-                          <s-text>{formatDate(operation.createdAt)}</s-text>
-                          {operation.completedAt && (
-                            <s-text tone="neutral" variant="bodySm">
-                              Completed: {formatDate(operation.completedAt)}
-                            </s-text>
+                    <IndexTable.Cell>
+                      {operation.results ? (
+                        <BlockStack gap="050">
+                          <Text tone="success" variant="bodySm" as="span">
+                            ✓ {operation.results.successful} successful
+                          </Text>
+                          {operation.results.failed > 0 && (
+                            <Text tone="critical" variant="bodySm" as="span">
+                              ✗ {operation.results.failed} failed
+                            </Text>
                           )}
-                        </s-stack>
-
-                        {/* Type */}
-                        <s-text>{formatOperationType(operation.type)}</s-text>
-
-                        {/* Status */}
-                        <div>
-                          <StatusBadge
-                            status={operation.status}
-                            undone={operation.undone}
-                          />
-                        </div>
-
-                        {/* Items Count */}
-                        <s-text>
-                          {operation.payload?.products?.length ?? 0} products
-                        </s-text>
-
-                        {/* Results */}
-                        <div>
-                          {operation.results ? (
-                            <s-stack gap="small-200">
-                              <s-text tone="success" variant="bodySm">
-                                ✓ {operation.results.successful} successful
-                              </s-text>
-                              {operation.results.failed > 0 && (
-                                <s-text tone="critical" variant="bodySm">
-                                  ✗ {operation.results.failed} failed
-                                </s-text>
-                              )}
-                            </s-stack>
-                          ) : operation.status === "RUNNING" ? (
-                            <s-text tone="neutral" variant="bodySm">
-                              In progress...
-                            </s-text>
-                          ) : operation.errorMessage ? (
-                            <s-text tone="critical" variant="bodySm">
-                              {operation.errorMessage}
-                            </s-text>
-                          ) : (
-                            <s-text tone="neutral" variant="bodySm">
-                              No results
-                            </s-text>
-                          )}
-                        </div>
-
-                        {/* Actions */}
-                        <div>
-                          {operation.status === "COMPLETED" &&
-                            !operation.undone &&
-                            operation.inversePayload && (
-                              <s-button
-                                variant="tertiary"
-                                size="small"
-                                onClick={() => handleUndo(operation.id)}
-                                disabled={
-                                  isUndoing &&
-                                  selectedOperation === operation.id
-                                }
-                              >
-                                {isUndoing && selectedOperation === operation.id
-                                  ? "Undoing..."
-                                  : "Undo"}
-                              </s-button>
-                            )}
-                          {operation.undone && (
-                            <s-text tone="neutral" variant="bodySm">
-                              Undone
-                            </s-text>
-                          )}
-                        </div>
-                      </s-grid>
-                    ))}
-                  </s-stack>
-                )}
-
-                {/* Pagination */}
-                {pagination.totalPages > 1 && (
-                  <s-stack
-                    direction="inline"
-                    gap="small-200"
-                    justifyContent="center"
-                    paddingBlock="base"
-                  >
-                    {pagination.page > 1 && (
-                      <Form method="get">
-                        <input
-                          type="hidden"
-                          name="page"
-                          value={pagination.page - 1}
-                        />
-                        {filters.status && (
-                          <input
-                            type="hidden"
-                            name="status"
-                            value={filters.status}
-                          />
+                        </BlockStack>
+                      ) : operation.status === "RUNNING" ? (
+                        <Text tone="subdued" variant="bodySm" as="span">
+                          In progress...
+                        </Text>
+                      ) : operation.errorMessage ? (
+                        <Text tone="critical" variant="bodySm" as="span">
+                          {operation.errorMessage}
+                        </Text>
+                      ) : (
+                        <Text tone="subdued" variant="bodySm" as="span">
+                          No results
+                        </Text>
+                      )}
+                    </IndexTable.Cell>
+                    <IndexTable.Cell>
+                      {operation.status === "COMPLETED" &&
+                        !operation.undone &&
+                        operation.inversePayload && (
+                          <Button
+                            variant="tertiary"
+                            size="slim"
+                            onClick={() => handleUndoClick(operation.id)}
+                            disabled={
+                              isUndoing && selectedOperation === operation.id
+                            }
+                          >
+                            {isUndoing && selectedOperation === operation.id
+                              ? "Undoing..."
+                              : "Undo"}
+                          </Button>
                         )}
-                        {filters.type && (
-                          <input
-                            type="hidden"
-                            name="type"
-                            value={filters.type}
-                          />
-                        )}
-                        <s-button type="submit" variant="tertiary">
-                          Previous
-                        </s-button>
-                      </Form>
-                    )}
-
-                    <s-text>
-                      Page {pagination.page} of {pagination.totalPages}
-                    </s-text>
-
-                    {pagination.page < pagination.totalPages && (
-                      <Form method="get">
-                        <input
-                          type="hidden"
-                          name="page"
-                          value={pagination.page + 1}
-                        />
-                        {filters.status && (
-                          <input
-                            type="hidden"
-                            name="status"
-                            value={filters.status}
-                          />
-                        )}
-                        {filters.type && (
-                          <input
-                            type="hidden"
-                            name="type"
-                            value={filters.type}
-                          />
-                        )}
-                        <s-button type="submit" variant="tertiary">
-                          Next
-                        </s-button>
-                      </Form>
-                    )}
-                  </s-stack>
-                )}
-              </s-stack>
-            </s-section>
-          </s-card>
-        </s-layout-section>
-      </s-layout>
-    </s-page>
+                      {operation.undone && (
+                        <Text tone="subdued" variant="bodySm" as="span">
+                          Undone
+                        </Text>
+                      )}
+                    </IndexTable.Cell>
+                  </IndexTable.Row>
+                ))}
+              </IndexTable>
+            </Card>
+          </Box>
+        </Layout.Section>
+      </Layout>
+      <Modal
+        open={undoModalOpen}
+        onClose={handleCloseModal}
+        title="Undo Operation"
+        primaryAction={{
+          content: "Undo",
+          onAction: handleConfirmUndo,
+          destructive: true,
+        }}
+        secondaryActions={[
+          {
+            content: "Cancel",
+            onAction: handleCloseModal,
+          },
+        ]}
+      >
+        <Modal.Section>
+          <BlockStack gap="400">
+            <Text as="p">Are you sure you want to undo this operation?</Text>
+            <Text as="p">
+              This will create a new bulk operation to revert the changes.
+            </Text>
+          </BlockStack>
+        </Modal.Section>
+      </Modal>
+    </Page>
   );
 }
 
 function StatusBadge({ status, undone }: { status: string; undone?: boolean }) {
   if (undone) {
-    return (
-      <s-badge tone="neutral" variant="subtle">
-        Undone
-      </s-badge>
-    );
+    return <Badge>Undone</Badge>;
   }
 
   switch (status) {
     case "COMPLETED":
-      return (
-        <s-badge tone="success" variant="subtle">
-          Completed
-        </s-badge>
-      );
+      return <Badge tone="success">Completed</Badge>;
     case "RUNNING":
-      return (
-        <s-badge tone="info" variant="subtle">
-          Running
-        </s-badge>
-      );
+      return <Badge tone="info">Running</Badge>;
     case "FAILED":
-      return (
-        <s-badge tone="critical" variant="subtle">
-          Failed
-        </s-badge>
-      );
+      return <Badge tone="critical">Failed</Badge>;
     case "CANCELED":
-      return (
-        <s-badge tone="neutral" variant="subtle">
-          Canceled
-        </s-badge>
-      );
+      return <Badge>Canceled</Badge>;
     default:
-      return (
-        <s-badge tone="neutral" variant="subtle">
-          {status}
-        </s-badge>
-      );
+      return <Badge>{status}</Badge>;
   }
 }
 
@@ -515,4 +538,59 @@ function formatDate(date: Date): string {
     dateStyle: "medium",
     timeStyle: "short",
   }).format(new Date(date));
+}
+
+function getOperationDescription(operation: OperationRecord): string {
+  if (operation.type === "PRICE_ADJUSTMENT") {
+    const payload = operation.payload as PriceAdjustmentPayload;
+    if (payload?.adjustment) {
+      const { direction, percentage } = payload.adjustment;
+      return `Price ${direction === "increase" ? "+" : "-"}${percentage}%`;
+    }
+  } else if (operation.type === "TAG_UPDATE") {
+    const payload = operation.payload as any;
+    if (payload?.update) {
+      const { action, tags } = payload.update;
+      return `${action === "add" ? "Add" : action === "remove" ? "Remove" : "Replace"} tags: ${tags.join(", ")}`;
+    }
+  }
+  return "";
+}
+
+function ProductDetails({ operation }: { operation: OperationRecord }) {
+  const payload = operation.payload as any;
+  const products = payload?.products || [];
+  const count = products.length;
+
+  if (count === 0)
+    return (
+      <Text tone="subdued" as="span">
+        No products
+      </Text>
+    );
+
+  const firstProduct = products[0];
+  const firstTitle = firstProduct?.title;
+
+  if (firstTitle) {
+    return (
+      <BlockStack gap="050">
+        <Text as="span" variant="bodyMd" fontWeight="semibold" truncate>
+          {firstTitle}
+        </Text>
+        {count > 1 && (
+          <Text tone="subdued" variant="bodySm" as="span">
+            + {count - 1} other{count > 2 ? "s" : ""}
+          </Text>
+        )}
+      </BlockStack>
+    );
+  }
+
+  // Fallback for old records without titles
+  return (
+    <Text as="span">
+      {count} product{count !== 1 ? "s" : ""}
+    </Text>
+  );
 }

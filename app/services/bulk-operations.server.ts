@@ -1,22 +1,22 @@
 /**
  * Bulk Operations Service 
- * 
- * Handles bulk operation lifecycle:
- * - Starting bulk operations
- * - Polling operation status
- * - Processing JSONL results
- * - Undo operations
+ *
+ * Fixes:
+ * - Graceful handling of "not found" bulk operations
+ * - Better error messages
+ * - Auto-cleanup of expired operations
  */
 
 import {
   createOperation,
   findActiveOperationForShop,
   findOperationById,
+  findStuckOperations,
   updateOperation,
-  type OperationRecord,
+  type OperationRecord
 } from "../models/operation.server";
 import { graphqlWithRetry, type AdminApiClient } from "./graphql-retry.server";
-import type { PricePreviewResult } from "./products.server";
+import type { PricePreviewResult, TagPreviewResult } from "./products.server";
 
 export type StartPriceAdjustmentBulkOperationInput = {
   admin: AdminApiClient;
@@ -24,11 +24,17 @@ export type StartPriceAdjustmentBulkOperationInput = {
   preview: PricePreviewResult;
 };
 
+export type StartTagUpdateBulkOperationInput = {
+  admin: AdminApiClient;
+  shop: string;
+  preview: TagPreviewResult;
+};
+
 export type StartPriceAdjustmentBulkOperationResult = {
   operation: OperationRecord;
 };
 
-export type BulkOperationStatus = 
+export type BulkOperationStatus =
   | "CREATED"
   | "RUNNING"
   | "COMPLETED"
@@ -59,10 +65,11 @@ export type BulkOperationResults = {
   }>;
 };
 
-type PriceAdjustmentPayload = {
+export type PriceAdjustmentPayload = {
   adjustment: PricePreviewResult["adjustment"];
   products: Array<{
     id: string;
+    title?: string;
     variants: Array<{
       id: string;
       price: number;
@@ -70,26 +77,41 @@ type PriceAdjustmentPayload = {
   }>;
 };
 
-type BulkOperationRunMutationResponse = {
-  data?: {
-    bulkOperationRunMutation?: {
-      bulkOperation?: {
-        id: string;
-        status: string;
-      };
-      userErrors?: Array<{
-        field?: string[];
-        message: string;
-      }>;
+
+type BulkOperationRunMutationPayload = {
+  bulkOperationRunMutation?: {
+    bulkOperation?: {
+      id: string;
+      status: string;
+      url: string;
     };
+    userErrors?: Array<{
+      field?: string[];
+      message: string;
+    }>;
   };
-  errors?: Array<{
-    message: string;
-  }>;
 };
 
-type BulkOperationQueryResponse = {
+type StagedUploadsCreatePayload = {
+  stagedUploadsCreate?: {
+    stagedTargets: Array<{
+      url: string;
+      resourceUrl: string | null;
+      parameters: Array<{
+        name: string;
+        value: string;
+      }>;
+    }>;
+    userErrors?: Array<{
+      field?: string[];
+      message: string;
+    }>;
+  };
+};
+
+type BulkOperationQueryPayload = {
   node?: {
+    __typename?: string;
     id: string;
     status: BulkOperationStatus;
     errorCode?: string;
@@ -98,15 +120,59 @@ type BulkOperationQueryResponse = {
     url?: string;
     createdAt: string;
     completedAt?: string;
-  };
+  } & { [key: string]: unknown };
 };
 
-type CurrentBulkOperationQueryResponse = {
+type CurrentBulkOperationQueryPayload = {
   currentBulkOperation?: {
     id: string;
     status: BulkOperationStatus;
   } | null;
 };
+
+/**
+ * Auto-cleanup stuck operations for a shop
+ */
+export async function cleanupStuckOperations(
+  admin: AdminApiClient,
+  shop: string
+): Promise<void> {
+
+  const stuckOperations = await findStuckOperations(shop);
+
+  if (stuckOperations.length === 0) {
+    console.log("✅ No stuck operations found");
+    return;
+  }
+
+  console.log(`⚠️ Found ${stuckOperations.length} stuck operations, cleaning up...`);
+
+  for (const operation of stuckOperations) {
+    if (operation.bulkOperationId) {
+      // Check if the operation still exists in Shopify
+      const status = await pollBulkOperationStatus(admin, operation.bulkOperationId);
+
+      if (status.status === "EXPIRED" || status.errorCode === "NOT_FOUND") {
+        await updateOperation({
+          id: operation.id,
+          status: "EXPIRED",
+          completedAt: new Date(),
+          errorMessage: "Auto-expired: bulk operation not found in Shopify or timed out (>1 hour)"
+        });
+        console.log(`⏰ Marked operation ${operation.id} as EXPIRED`);
+      }
+    } else {
+      // No bulk operation ID, mark as FAILED
+      await updateOperation({
+        id: operation.id,
+        status: "FAILED",
+        completedAt: new Date(),
+        errorMessage: "Auto-failed: no bulk operation ID found after 1 hour"
+      });
+      console.log(`❌ Marked operation ${operation.id} as FAILED`);
+    }
+  }
+}
 
 /**
  * Start a price adjustment bulk operation
@@ -116,6 +182,9 @@ export async function startPriceAdjustmentBulkOperation({
   shop,
   preview,
 }: StartPriceAdjustmentBulkOperationInput): Promise<StartPriceAdjustmentBulkOperationResult> {
+  // 🔧 FIX: Auto-cleanup stuck operations first
+  await cleanupStuckOperations(admin, shop);
+
   // Check for active operations
   const activeOperation = await findActiveOperationForShop(shop);
   if (activeOperation) {
@@ -126,12 +195,28 @@ export async function startPriceAdjustmentBulkOperation({
     throw new Error("Cannot start bulk operation without products.");
   }
 
-  const mutation = buildPriceAdjustmentMutation(preview);
+  // 1. Prepare JSONL Data
+  const jsonlLines = preview.products
+    .map((product) => {
+      const variables = {
+        productId: product.id,
+        variants: product.variants.map((v) => ({
+          id: v.id,
+          price: v.priceAfter.toFixed(2),
+        })),
+      };
+      return JSON.stringify(variables);
+    })
+    .join("\n");
+
+  // 2. Upload JSONL via Staged Uploads
+  const stagedPath = await uploadBulkOperationFile(admin, jsonlLines);
 
   const payload: PriceAdjustmentPayload = {
     adjustment: preview.adjustment,
     products: preview.products.map((product) => ({
       id: product.id,
+      title: product.title,
       variants: product.variants.map((variant) => ({
         id: variant.id,
         price: variant.priceAfter,
@@ -142,11 +227,13 @@ export async function startPriceAdjustmentBulkOperation({
   // Create inverse payload for undo
   const inversePayload: PriceAdjustmentPayload = {
     adjustment: {
-      direction: preview.adjustment.direction === "increase" ? "decrease" : "increase",
+      direction:
+        preview.adjustment.direction === "increase" ? "decrease" : "increase",
       percentage: preview.adjustment.percentage,
     },
     products: preview.products.map((product) => ({
       id: product.id,
+      title: product.title,
       variants: product.variants.map((variant) => ({
         id: variant.id,
         price: variant.priceBefore,
@@ -157,20 +244,25 @@ export async function startPriceAdjustmentBulkOperation({
   const operationRecord = await createOperation({
     shop,
     type: "PRICE_ADJUSTMENT",
-    payload,
-    inversePayload,
+    payload: JSON.parse(JSON.stringify(payload)),
+    inversePayload: JSON.parse(JSON.stringify(inversePayload)),
   });
 
   try {
-    const response = await graphqlWithRetry<BulkOperationRunMutationResponse>(
+    // 3. Run Bulk Operation with Staged Path
+    const response = await graphqlWithRetry<BulkOperationRunMutationPayload>(
       admin,
       START_BULK_OPERATION_MUTATION,
       {
-        variables: { mutation },
+        variables: {
+          mutation: PRICE_ADJUSTMENT_MUTATION,
+          stagedUploadPath: stagedPath,
+        },
       }
     );
 
-    const userErrors = response.data?.bulkOperationRunMutation?.userErrors ?? [];
+    const userErrors =
+      response.data?.bulkOperationRunMutation?.userErrors ?? [];
     if (userErrors.length) {
       const message = userErrors.map((error) => error.message).join("\n");
       await updateOperation({
@@ -198,10 +290,14 @@ export async function startPriceAdjustmentBulkOperation({
       bulkOperationId,
     });
 
+    console.log(`✅ Bulk operation created: ${bulkOperationId}`);
+
     return { operation: updated };
-  } catch (error) {
+  } catch (error: unknown) {
     const message =
-      error instanceof Error ? error.message : "Failed to start bulk operation.";
+      error instanceof Error
+        ? error.message
+        : "Failed to start bulk operation.";
     await updateOperation({
       id: operationRecord.id,
       status: "FAILED",
@@ -212,50 +308,223 @@ export async function startPriceAdjustmentBulkOperation({
 }
 
 /**
- * Poll bulk operation status
+ * Start a tag update bulk operation
+ */
+export async function startTagUpdateBulkOperation({
+  admin,
+  shop,
+  preview,
+}: StartTagUpdateBulkOperationInput): Promise<StartPriceAdjustmentBulkOperationResult> {
+  // Auto-cleanup stuck operations first
+  await cleanupStuckOperations(admin, shop);
+
+  // Check for active operations
+  const activeOperation = await findActiveOperationForShop(shop);
+  if (activeOperation) {
+    throw new Error("A bulk operation is already in progress for this shop.");
+  }
+
+  if (!preview.products.length) {
+    throw new Error("Cannot start bulk operation without products.");
+  }
+
+  // 1. Prepare JSONL Data
+  const jsonlLines = preview.products
+    .map((product) => {
+      const variables = {
+        input: {
+          id: product.id,
+          tags: product.tagsAfter,
+        },
+      };
+      return JSON.stringify(variables);
+    })
+    .join("\n");
+
+  // 2. Upload JSONL via Staged Uploads
+  const stagedPath = await uploadBulkOperationFile(admin, jsonlLines);
+
+  const payload = {
+    update: preview.update,
+    products: preview.products.map((product) => ({
+      id: product.id,
+      title: product.title,
+      tagsBefore: product.tagsBefore,
+      tagsAfter: product.tagsAfter,
+    })),
+  };
+
+  // Create inverse payload for undo
+  const inversePayload = {
+    update: {
+      action: "replace" as const,
+      tags: [],
+      replaceTags: preview.products.map((p) => p.tagsBefore).flat(),
+    },
+    products: preview.products.map((product) => ({
+      id: product.id,
+      title: product.title,
+      tagsBefore: product.tagsAfter,
+      tagsAfter: product.tagsBefore,
+    })),
+  };
+
+  const operationRecord = await createOperation({
+    shop,
+    type: "TAG_UPDATE",
+    payload: JSON.parse(JSON.stringify(payload)),
+    inversePayload: JSON.parse(JSON.stringify(inversePayload)),
+  });
+
+  try {
+    // 3. Run Bulk Operation with Staged Path
+    const response = await graphqlWithRetry<BulkOperationRunMutationPayload>(
+      admin,
+      START_BULK_OPERATION_MUTATION,
+      {
+        variables: {
+          mutation: TAG_UPDATE_MUTATION,
+          stagedUploadPath: stagedPath,
+        },
+      }
+    );
+
+    const userErrors =
+      response.data?.bulkOperationRunMutation?.userErrors ?? [];
+    if (userErrors.length) {
+      const message = userErrors.map((error) => error.message).join("\n");
+      await updateOperation({
+        id: operationRecord.id,
+        status: "FAILED",
+        errorMessage: message,
+      });
+      throw new Error(message || "Failed to start bulk operation.");
+    }
+
+    const bulkOperationId =
+      response.data?.bulkOperationRunMutation?.bulkOperation?.id;
+    if (!bulkOperationId) {
+      await updateOperation({
+        id: operationRecord.id,
+        status: "FAILED",
+        errorMessage: "Shopify did not return a bulk operation id.",
+      });
+      throw new Error("Shopify did not return a bulk operation id.");
+    }
+
+    const updated = await updateOperation({
+      id: operationRecord.id,
+      status: "RUNNING",
+      bulkOperationId,
+    });
+
+    console.log(`✅ Tag update bulk operation created: ${bulkOperationId}`);
+
+    return { operation: updated };
+  } catch (error: unknown) {
+    const message =
+      error instanceof Error
+        ? error.message
+        : "Failed to start bulk operation.";
+    await updateOperation({
+      id: operationRecord.id,
+      status: "FAILED",
+      errorMessage: message,
+    });
+    throw error;
+  }
+}
+
+/**
+ * Poll bulk operation status 
  */
 export async function pollBulkOperationStatus(
   admin: AdminApiClient,
   bulkOperationId: string
 ): Promise<BulkOperationPollResult> {
-  const response = await graphqlWithRetry<BulkOperationQueryResponse>(
-    admin,
-    BULK_OPERATION_STATUS_QUERY,
-    {
-      variables: { id: bulkOperationId },
+  try {
+    const response = await graphqlWithRetry<BulkOperationQueryPayload>(
+      admin,
+      BULK_OPERATION_STATUS_QUERY,
+      {
+        variables: { id: bulkOperationId },
+      }
+    );
+
+    if (!response.data?.node) {
+      console.warn(`⚠️ Bulk operation not found in Shopify: ${bulkOperationId}`);
+
+      // Retornar un resultado "EXPIRED" en vez de lanzar error
+      return {
+        id: bulkOperationId,
+        status: "EXPIRED",
+        errorCode: "NOT_FOUND",
+        createdAt: new Date().toISOString(),
+        completedAt: new Date().toISOString(),
+      };
     }
-  );
 
-  if (!response.data?.node) {
-    throw new Error(`Bulk operation ${bulkOperationId} not found.`);
+    const node = response.data.node as {
+      id: string;
+      status: BulkOperationStatus;
+      errorCode?: string;
+      objectCount?: number;
+      fileSize?: number;
+      url?: string;
+      createdAt: string;
+      completedAt?: string;
+    };
+
+    return {
+      id: node.id,
+      status: node.status,
+      errorCode: node.errorCode,
+      objectCount: node.objectCount,
+      fileSize: node.fileSize,
+      url: node.url,
+      createdAt: node.createdAt,
+      completedAt: node.completedAt,
+    } satisfies BulkOperationPollResult;
+  } catch (error) {
+    console.error(`❌ Error polling bulk operation ${bulkOperationId}:`, error);
+
+    return {
+      id: bulkOperationId,
+      status: "FAILED",
+      errorCode: "POLL_ERROR",
+      createdAt: new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+    };
   }
-
-  return response.data.node;
 }
 
 /**
- * Check if there's an active bulk operation for the shop
+ * Check if there's an active bulk operation - SAFE VERSION
  */
 export async function checkActiveBulkOperation(
   admin: AdminApiClient
 ): Promise<{ id: string; status: BulkOperationStatus } | null> {
-  const response = await graphqlWithRetry<CurrentBulkOperationQueryResponse>(
-    admin,
-    CURRENT_BULK_OPERATION_QUERY
-  );
+  try {
+    const response = await graphqlWithRetry<CurrentBulkOperationQueryPayload>(
+      admin,
+      CURRENT_BULK_OPERATION_QUERY
+    );
 
-  const operation = response.data?.currentBulkOperation;
-  
-  if (!operation) {
+    const operation = response.data?.currentBulkOperation;
+
+    if (!operation) {
+      return null;
+    }
+
+    if (operation.status === "RUNNING" || operation.status === "CREATED") {
+      return operation;
+    }
+
     return null;
+  } catch (error) {
+    console.error("Error checking active bulk operation:", error);
+    return null; // Fail gracefully
   }
-
-  // Only return if truly active (not completed/failed)
-  if (operation.status === "RUNNING" || operation.status === "CREATED") {
-    return operation;
-  }
-
-  return null;
 }
 
 /**
@@ -265,7 +534,7 @@ export async function processBulkOperationResults(
   resultsUrl: string
 ): Promise<BulkOperationResults> {
   const response = await fetch(resultsUrl);
-  
+
   if (!response.ok) {
     throw new Error(`Failed to fetch results: ${response.statusText}`);
   }
@@ -283,10 +552,8 @@ export async function processBulkOperationResults(
     try {
       const item = JSON.parse(line);
 
-      // Check for user errors in the response
       if (item.userErrors && item.userErrors.length > 0) {
         results.failed++;
-        
         for (const error of item.userErrors) {
           results.errors.push({
             productId: item.__parentId,
@@ -294,8 +561,15 @@ export async function processBulkOperationResults(
             field: error.field?.join("."),
           });
         }
-      } else if (item.id) {
-        // Successful update
+      } else if (item.data?.productVariantsBulkUpdate?.userErrors?.length > 0) {
+        results.failed++;
+        for (const error of item.data.productVariantsBulkUpdate.userErrors) {
+          results.errors.push({
+            message: error.message,
+            field: error.field?.join("."),
+          });
+        }
+      } else {
         results.successful++;
       }
     } catch (parseError) {
@@ -310,26 +584,42 @@ export async function processBulkOperationResults(
 }
 
 /**
- * Update operation with completed status and results
+ * Update operation with completed status - IMPROVED
  */
 export async function completeBulkOperation(
   operationId: string,
   bulkOperationResult: BulkOperationPollResult
 ): Promise<OperationRecord> {
   const updates: {
-    status: "COMPLETED" | "FAILED" | "CANCELED";
+    status: "COMPLETED" | "FAILED" | "CANCELLED" | "EXPIRED";
     completedAt: Date;
     errorMessage?: string;
     results?: BulkOperationResults;
   } = {
-    status: bulkOperationResult.status === "COMPLETED" ? "COMPLETED" : "FAILED",
+    status: bulkOperationResult.status === "COMPLETED" ? "COMPLETED" :
+      bulkOperationResult.status === "EXPIRED" ? "EXPIRED" :
+        "FAILED",
     completedAt: new Date(bulkOperationResult.completedAt ?? Date.now()),
   };
+
+  if (bulkOperationResult.status === "EXPIRED" || bulkOperationResult.errorCode === "NOT_FOUND") {
+    updates.status = "EXPIRED";
+    updates.errorMessage = "Bulk operation expired or not found in Shopify. This can happen with old operations (>7 days).";
+
+    console.log(`⚠️ Marking operation ${operationId} as EXPIRED`);
+
+    return await updateOperation({
+      id: operationId,
+      ...updates,
+    });
+  }
 
   // Process results if available
   if (bulkOperationResult.url && bulkOperationResult.status === "COMPLETED") {
     try {
-      const results = await processBulkOperationResults(bulkOperationResult.url);
+      const results = await processBulkOperationResults(
+        bulkOperationResult.url
+      );
       updates.results = results;
     } catch (error) {
       console.error("Failed to process bulk operation results:", error);
@@ -338,9 +628,13 @@ export async function completeBulkOperation(
   }
 
   // Handle errors
-  if (bulkOperationResult.errorCode || bulkOperationResult.status === "FAILED") {
+  if (
+    bulkOperationResult.errorCode ||
+    bulkOperationResult.status === "FAILED"
+  ) {
     updates.status = "FAILED";
-    updates.errorMessage = bulkOperationResult.errorCode || "Bulk operation failed";
+    updates.errorMessage =
+      bulkOperationResult.errorCode || "Bulk operation failed";
   }
 
   return await updateOperation({
@@ -371,79 +665,205 @@ export async function undoOperation(
     throw new Error("Operation does not support undo");
   }
 
-  if (operation.type !== "PRICE_ADJUSTMENT") {
-    throw new Error("Undo not implemented for this operation type");
+  if (operation.type === "PRICE_ADJUSTMENT") {
+    const inversePayload = operation.inversePayload as PriceAdjustmentPayload;
+
+    const preview: PricePreviewResult = {
+      adjustment: inversePayload.adjustment,
+      products: inversePayload.products.map((product) => ({
+        id: product.id,
+        title: product.title || "",
+        status: "",
+        tags: [],
+        variants: product.variants.map((variant) => ({
+          id: variant.id,
+          title: "",
+          priceBefore: variant.price,
+          priceAfter: variant.price,
+          currencyCode: "",
+        })),
+      })),
+    };
+
+    const result = await startPriceAdjustmentBulkOperation({
+      admin,
+      shop,
+      preview,
+    });
+
+    await updateOperation({
+      id: operationId,
+      undone: true,
+      undoneAt: new Date(),
+      undoneByOperationId: result.operation.id,
+    });
+
+    return result;
+  } else if (operation.type === "TAG_UPDATE") {
+    const inversePayload = operation.inversePayload as any; // TagUpdatePayload
+
+    const preview: TagPreviewResult = {
+      update: inversePayload.update,
+      products: inversePayload.products.map((product: any) => ({
+        id: product.id,
+        title: product.title || "",
+        status: "",
+        tagsBefore: product.tags,
+        tags: product.tagsBefore, 
+        variants: []
+      })),
+    };
+
+    const tagPreview: TagPreviewResult = {
+      update: inversePayload.update,
+      products: inversePayload.products.map((product: any) => ({
+        id: product.id,
+        title: product.title || "",
+        status: "",
+        tags: [], 
+        tagsBefore: product.tagsBefore,
+        tagsAfter: product.tagsAfter, 
+      })),
+    };
+
+    const result = await startTagUpdateBulkOperation({
+      admin,
+      shop,
+      preview: tagPreview,
+    });
+
+    await updateOperation({
+      id: operationId,
+      undone: true,
+      undoneAt: new Date(),
+      undoneByOperationId: result.operation.id,
+    });
+
+    return result as any;
   }
 
-  // Build preview from inverse payload
-  const inversePayload = operation.inversePayload as PriceAdjustmentPayload;
-  
-  const preview: PricePreviewResult = {
-    adjustment: inversePayload.adjustment,
-    products: inversePayload.products.map((product) => ({
-      id: product.id,
-      title: "", // Not needed for undo
-      status: "",
-      tags: [],
-      variants: product.variants.map((variant) => ({
-        id: variant.id,
-        title: "",
-        priceBefore: variant.price, // In undo, "before" is what we're reverting to
-        priceAfter: variant.price,
-        currencyCode: "",
-      })),
-    })),
-  };
-
-  // Start the undo operation
-  const result = await startPriceAdjustmentBulkOperation({
-    admin,
-    shop,
-    preview,
-  });
-
-  // Mark original operation as undone
-  await updateOperation({
-    id: operationId,
-    undone: true,
-    undoneAt: new Date(),
-    undoneByOperationId: result.operation.id,
-  });
-
-  return result;
+  throw new Error("Undo not implemented for this operation type");
 }
 
 /**
- * Build price adjustment mutation string
+ * Uploads a string content to a staged upload URL
  */
-function buildPriceAdjustmentMutation(preview: PricePreviewResult): string {
-  const aliasMutations = preview.products
-    .map((product, productIndex) => {
-      const variantsMutations = product.variants
-        .map((variant) => {
-          const price = variant.priceAfter.toFixed(2);
-          return `{ id: "${variant.id}", price: "${price}" }`;
-        })
-        .join(",\n");
+async function uploadBulkOperationFile(
+  admin: AdminApiClient,
+  jsonlContent: string
+): Promise<string> {
+  const response = await graphqlWithRetry<StagedUploadsCreatePayload>(
+    admin,
+    STAGED_UPLOADS_CREATE_MUTATION,
+    {
+      variables: {
+        input: [
+          {
+            resource: "BULK_MUTATION_VARIABLES",
+            filename: "bulk_op_vars.jsonl",
+            mimeType: "text/jsonl",
+            httpMethod: "POST",
+          },
+        ],
+      },
+    }
+  );
 
-      return `update_${productIndex}: productVariantsBulkUpdate(productId: "${product.id}", variants: [${variantsMutations}]) { 
-        productVariants { id price }
-        userErrors { field message } 
-      }`;
-    })
-    .join("\n");
+  const target = response.data?.stagedUploadsCreate?.stagedTargets?.[0];
+  const userErrors = response.data?.stagedUploadsCreate?.userErrors;
 
-  return `mutation {\n${aliasMutations}\n}`;
+  if (userErrors?.length) {
+    throw new Error(
+      `Staged upload failed: ${userErrors.map((e) => e.message).join(", ")}`
+    );
+  }
+
+  if (!target?.url || !target?.parameters) {
+    throw new Error("Failed to get staged upload target.");
+  }
+
+  const formData = new FormData();
+  for (const param of target.parameters) {
+    formData.append(param.name, param.value);
+  }
+  formData.append("file", new Blob([jsonlContent], { type: "text/jsonl" }));
+
+  const uploadResponse = await fetch(target.url, {
+    method: "POST",
+    body: formData,
+  });
+
+  if (!uploadResponse.ok) {
+    throw new Error(`Failed to upload file: ${uploadResponse.statusText}`);
+  }
+
+  const keyParam = target.parameters.find((p) => p.name === "key");
+  if (!keyParam) throw new Error("Missing key parameter in staged upload.");
+
+  return keyParam.value;
 }
 
-// GraphQL Queries
+// GraphQL Mutations and Queries
+
+const STAGED_UPLOADS_CREATE_MUTATION = `#graphql
+  mutation StagedUploadsCreate($input: [StagedUploadInput!]!) {
+    stagedUploadsCreate(input: $input) {
+      stagedTargets {
+        url
+        resourceUrl
+        parameters {
+          name
+          value
+        }
+      }
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;
 
 const START_BULK_OPERATION_MUTATION = `#graphql
-  mutation StartBulkOperation($mutation: String!) {
-    bulkOperationRunMutation(mutation: $mutation) {
+  mutation StartBulkOperation($mutation: String!, $stagedUploadPath: String!) {
+    bulkOperationRunMutation(mutation: $mutation, stagedUploadPath: $stagedUploadPath) {
       bulkOperation {
         id
         status
+        url
+      }
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;
+
+const PRICE_ADJUSTMENT_MUTATION = `
+  mutation PriceAdjustment($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+    productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+      product {
+        id
+      }
+      productVariants {
+        id
+        price
+      }
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;
+
+const TAG_UPDATE_MUTATION = `
+  mutation TagUpdate($input: ProductInput!) {
+    productUpdate(input: $input) {
+      product {
+        id
+        tags
       }
       userErrors {
         field

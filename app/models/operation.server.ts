@@ -7,54 +7,29 @@
  * - Status history
  */
 
+import { OperationStatus, OperationType, Prisma } from "@prisma/client";
+import prisma from "../db.server";
 import { type BulkOperationResults } from "../services/bulk-operations.server";
 
-// This is a placeholder - replace with your actual database client
-// Examples: Prisma, Drizzle, raw SQLite, etc.
-
-export type OperationType = "PRICE_ADJUSTMENT" | "TAG_UPDATE" | "STATUS_CHANGE";
-
-export type OperationStatus = 
-  | "CREATED"
-  | "RUNNING"
-  | "COMPLETED"
-  | "FAILED"
-  | "CANCELED";
-
-export type OperationRecord = {
-  id: string;
-  shop: string;
-  type: OperationType;
-  status: OperationStatus;
-  payload: any; // JSON payload with operation details
-  inversePayload?: any; // JSON payload for undo
-  bulkOperationId?: string;
-  results?: BulkOperationResults;
-  errorMessage?: string;
-  undone?: boolean;
-  undoneAt?: Date;
-  undoneByOperationId?: string;
-  createdAt: Date;
-  completedAt?: Date;
-};
+export type OperationRecord = Prisma.OperationGetPayload<Record<string, never>>;
 
 type CreateOperationInput = {
   shop: string;
   type: OperationType;
-  payload: any;
-  inversePayload?: any;
+  payload: Prisma.InputJsonValue;
+  inversePayload?: Prisma.NullableJsonNullValueInput;
 };
 
 type UpdateOperationInput = {
   id: string;
   status?: OperationStatus;
-  bulkOperationId?: string;
+  bulkOperationId?: string | null;
   results?: BulkOperationResults;
   errorMessage?: string;
-  completedAt?: Date;
+  completedAt?: Date | null;
   undone?: boolean;
-  undoneAt?: Date;
-  undoneByOperationId?: string;
+  undoneAt?: Date | null;
+  undoneByOperationId?: string | null;
 };
 
 /**
@@ -63,35 +38,14 @@ type UpdateOperationInput = {
 export async function createOperation(
   input: CreateOperationInput
 ): Promise<OperationRecord> {
-  const operation: OperationRecord = {
-    id: generateId(),
-    shop: input.shop,
-    type: input.type,
-    status: "CREATED",
-    payload: input.payload,
-    inversePayload: input.inversePayload,
-    createdAt: new Date(),
-  };
-
-  // Example using SQLite (adjust for your database)
-  await db.execute({
-    sql: `
-      INSERT INTO operations (
-        id, shop, type, status, payload, inverse_payload, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)
-    `,
-    args: [
-      operation.id,
-      operation.shop,
-      operation.type,
-      operation.status,
-      JSON.stringify(operation.payload),
-      operation.inversePayload ? JSON.stringify(operation.inversePayload) : null,
-      operation.createdAt.toISOString(),
-    ],
+  return prisma.operation.create({
+    data: {
+      shop: input.shop,
+      type: input.type,
+      payload: input.payload,
+      inversePayload: input.inversePayload || undefined,
+    },
   });
-
-  return operation;
 }
 
 /**
@@ -100,60 +54,12 @@ export async function createOperation(
 export async function updateOperation(
   input: UpdateOperationInput
 ): Promise<OperationRecord> {
-  const updates: string[] = [];
-  const args: any[] = [];
+  const { id, ...updates } = input;
 
-  if (input.status !== undefined) {
-    updates.push("status = ?");
-    args.push(input.status);
-  }
-
-  if (input.bulkOperationId !== undefined) {
-    updates.push("bulk_operation_id = ?");
-    args.push(input.bulkOperationId);
-  }
-
-  if (input.results !== undefined) {
-    updates.push("results = ?");
-    args.push(JSON.stringify(input.results));
-  }
-
-  if (input.errorMessage !== undefined) {
-    updates.push("error_message = ?");
-    args.push(input.errorMessage);
-  }
-
-  if (input.completedAt !== undefined) {
-    updates.push("completed_at = ?");
-    args.push(input.completedAt.toISOString());
-  }
-
-  if (input.undone !== undefined) {
-    updates.push("undone = ?");
-    args.push(input.undone ? 1 : 0);
-  }
-
-  if (input.undoneAt !== undefined) {
-    updates.push("undone_at = ?");
-    args.push(input.undoneAt.toISOString());
-  }
-
-  if (input.undoneByOperationId !== undefined) {
-    updates.push("undone_by_operation_id = ?");
-    args.push(input.undoneByOperationId);
-  }
-
-  updates.push("updated_at = ?");
-  args.push(new Date().toISOString());
-
-  args.push(input.id);
-
-  await db.execute({
-    sql: `UPDATE operations SET ${updates.join(", ")} WHERE id = ?`,
-    args,
+  return prisma.operation.update({
+    where: { id },
+    data: updates,
   });
-
-  return await findOperationById(input.id);
 }
 
 /**
@@ -162,16 +68,9 @@ export async function updateOperation(
 export async function findOperationById(
   id: string
 ): Promise<OperationRecord | null> {
-  const result = await db.execute({
-    sql: "SELECT * FROM operations WHERE id = ?",
-    args: [id],
+  return prisma.operation.findUnique({
+    where: { id },
   });
-
-  if (!result.rows.length) {
-    return null;
-  }
-
-  return mapRowToOperation(result.rows[0]);
 }
 
 /**
@@ -180,16 +79,9 @@ export async function findOperationById(
 export async function findOperationByBulkId(
   bulkOperationId: string
 ): Promise<OperationRecord | null> {
-  const result = await db.execute({
-    sql: "SELECT * FROM operations WHERE bulk_operation_id = ?",
-    args: [bulkOperationId],
+  return prisma.operation.findFirst({
+    where: { bulkOperationId },
   });
-
-  if (!result.rows.length) {
-    return null;
-  }
-
-  return mapRowToOperation(result.rows[0]);
 }
 
 /**
@@ -198,22 +90,37 @@ export async function findOperationByBulkId(
 export async function findActiveOperationForShop(
   shop: string
 ): Promise<OperationRecord | null> {
-  const result = await db.execute({
-    sql: `
-      SELECT * FROM operations 
-      WHERE shop = ? 
-      AND status IN ('CREATED', 'RUNNING')
-      ORDER BY created_at DESC
-      LIMIT 1
-    `,
-    args: [shop],
+  return prisma.operation.findFirst({
+    where: {
+      shop,
+      status: {
+        in: ["CREATED", "RUNNING"],
+      },
+    },
+    orderBy: { createdAt: "desc" },
   });
+}
 
-  if (!result.rows.length) {
-    return null;
-  }
-
-  return mapRowToOperation(result.rows[0]);
+/**
+ * Find operations that need cleanup (stuck or expired)
+ */
+export async function findStuckOperations(
+  shop: string
+): Promise<OperationRecord[]> {
+  const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+  
+  return prisma.operation.findMany({
+    where: {
+      shop,
+      status: {
+        in: ["CREATED", "RUNNING"],
+      },
+      createdAt: {
+        lt: oneHourAgo,
+      },
+    },
+    orderBy: { createdAt: "asc" },
+  });
 }
 
 /**
@@ -228,44 +135,27 @@ export async function findOperationsByShop(
     type?: OperationType;
   }
 ): Promise<{ operations: OperationRecord[]; total: number }> {
-  const conditions: string[] = ["shop = ?"];
-  const args: any[] = [shop];
+  const where: Record<string, unknown> = { shop };
 
   if (options?.status) {
-    conditions.push("status = ?");
-    args.push(options.status);
+    where.status = options.status;
   }
 
   if (options?.type) {
-    conditions.push("type = ?");
-    args.push(options.type);
+    where.type = options.type;
   }
 
-  // Get total count
-  const countResult = await db.execute({
-    sql: `SELECT COUNT(*) as count FROM operations WHERE ${conditions.join(" AND ")}`,
-    args,
-  });
-  const total = Number(countResult.rows[0].count);
+  const [operations, total] = await Promise.all([
+    prisma.operation.findMany({
+      where,
+      orderBy: { createdAt: "desc" },
+      take: options?.limit ?? 50,
+      skip: options?.offset ?? 0,
+    }),
+    prisma.operation.count({ where }),
+  ]);
 
-  // Get paginated results
-  const limit = options?.limit ?? 50;
-  const offset = options?.offset ?? 0;
-
-  const result = await db.execute({
-    sql: `
-      SELECT * FROM operations 
-      WHERE ${conditions.join(" AND ")}
-      ORDER BY created_at DESC
-      LIMIT ? OFFSET ?
-    `,
-    args: [...args, limit, offset],
-  });
-
-  return {
-    operations: result.rows.map(mapRowToOperation),
-    total,
-  };
+  return { operations, total };
 }
 
 /**
@@ -277,16 +167,14 @@ export async function deleteOldOperations(
   const cutoffDate = new Date();
   cutoffDate.setDate(cutoffDate.getDate() - olderThanDays);
 
-  const result = await db.execute({
-    sql: `
-      DELETE FROM operations 
-      WHERE created_at < ? 
-      AND status IN ('COMPLETED', 'FAILED', 'CANCELED')
-    `,
-    args: [cutoffDate.toISOString()],
+  const result = await prisma.operation.deleteMany({
+    where: {
+      createdAt: { lt: cutoffDate },
+      status: { in: ["COMPLETED", "FAILED", "CANCELLED"] },
+    },
   });
 
-  return result.rowsAffected ?? 0;
+  return result.count;
 }
 
 /**
@@ -298,97 +186,17 @@ export async function getOperationStats(shop: string): Promise<{
   failed: number;
   running: number;
 }> {
-  const result = await db.execute({
-    sql: `
-      SELECT 
-        COUNT(*) as total,
-        SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END) as completed,
-        SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) as failed,
-        SUM(CASE WHEN status = 'RUNNING' THEN 1 ELSE 0 END) as running
-      FROM operations
-      WHERE shop = ?
-    `,
-    args: [shop],
-  });
+  const [total, completed, failed, running] = await Promise.all([
+    prisma.operation.count({ where: { shop } }),
+    prisma.operation.count({ where: { shop, status: "COMPLETED" } }),
+    prisma.operation.count({ where: { shop, status: "FAILED" } }),
+    prisma.operation.count({ where: { shop, status: "RUNNING" } }),
+  ]);
 
-  const row = result.rows[0];
   return {
-    total: Number(row.total ?? 0),
-    completed: Number(row.completed ?? 0),
-    failed: Number(row.failed ?? 0),
-    running: Number(row.running ?? 0),
+    total,
+    completed,
+    failed,
+    running,
   };
-}
-
-/**
- * Map database row to OperationRecord
- */
-function mapRowToOperation(row: any): OperationRecord {
-  return {
-    id: row.id,
-    shop: row.shop,
-    type: row.type,
-    status: row.status,
-    payload: row.payload ? JSON.parse(row.payload) : null,
-    inversePayload: row.inverse_payload ? JSON.parse(row.inverse_payload) : undefined,
-    bulkOperationId: row.bulk_operation_id ?? undefined,
-    results: row.results ? JSON.parse(row.results) : undefined,
-    errorMessage: row.error_message ?? undefined,
-    undone: Boolean(row.undone),
-    undoneAt: row.undone_at ? new Date(row.undone_at) : undefined,
-    undoneByOperationId: row.undone_by_operation_id ?? undefined,
-    createdAt: new Date(row.created_at),
-    completedAt: row.completed_at ? new Date(row.completed_at) : undefined,
-  };
-}
-
-/**
- * Generate unique ID (use UUID in production)
- */
-function generateId(): string {
-  return `op_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
-}
-
-/**
- * Initialize database schema (SQLite example)
- */
-export async function initializeOperationsTable() {
-  await db.execute({
-    sql: `
-      CREATE TABLE IF NOT EXISTS operations (
-        id TEXT PRIMARY KEY,
-        shop TEXT NOT NULL,
-        type TEXT NOT NULL,
-        status TEXT NOT NULL,
-        payload TEXT NOT NULL,
-        inverse_payload TEXT,
-        bulk_operation_id TEXT,
-        results TEXT,
-        error_message TEXT,
-        undone INTEGER DEFAULT 0,
-        undone_at TEXT,
-        undone_by_operation_id TEXT,
-        created_at TEXT NOT NULL,
-        completed_at TEXT,
-        updated_at TEXT
-      )
-    `,
-    args: [],
-  });
-
-  // Create indexes for common queries
-  await db.execute({
-    sql: "CREATE INDEX IF NOT EXISTS idx_operations_shop ON operations(shop)",
-    args: [],
-  });
-
-  await db.execute({
-    sql: "CREATE INDEX IF NOT EXISTS idx_operations_status ON operations(status)",
-    args: [],
-  });
-
-  await db.execute({
-    sql: "CREATE INDEX IF NOT EXISTS idx_operations_bulk_id ON operations(bulk_operation_id)",
-    args: [],
-  });
 }

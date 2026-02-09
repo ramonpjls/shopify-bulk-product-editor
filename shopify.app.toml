@@ -2,7 +2,7 @@
 
 client_id = "0e4cd59900d13bd06240891a807a64f4"
 name = "bulk-product-editor"
-application_url = "https://example.com"
+application_url = "https://bulk-product-editor.myshopify.com"
 embedded = true
 
 [build]
@@ -10,7 +10,7 @@ automatically_update_urls_on_dev = true
 include_config_on_deploy = true
 
 [webhooks]
-api_version = "2026-04"
+api_version = "2025-10"
 
   [[webhooks.subscriptions]]
   topics = [ "app/uninstalled" ]
@@ -19,6 +19,11 @@ api_version = "2026-04"
   [[webhooks.subscriptions]]
   topics = [ "app/scopes_update" ]
   uri = "/webhooks/app/scopes_update"
+
+
+  [[webhooks.subscriptions]]
+  topics = [ "bulk_operations/finish" ]
+  uri = "/webhooks/bulk-operations"
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes

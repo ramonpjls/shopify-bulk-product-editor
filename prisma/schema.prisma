@@ -15,6 +15,7 @@ datasource db {
 
 enum OperationType {
   PRICE_ADJUSTMENT
+  TAG_UPDATE
 }
 
 enum OperationStatus {
@@ -23,6 +24,7 @@ enum OperationStatus {
   COMPLETED
   FAILED
   CANCELLED
+  EXPIRED
 }
 
 model Session {
@@ -54,10 +56,14 @@ model Operation {
   inversePayload Json?
   bulkOperationId String?         @unique
   resultUrl      String?
+  results        Json?            // Store bulk operation results (successful/failed counts)
   errorMessage   String?
   createdAt      DateTime         @default(now())
   updatedAt      DateTime         @updatedAt
   completedAt    DateTime?
+  undone         Boolean?         @default(false)
+  undoneAt       DateTime?
+  undoneByOperationId String?
 
   @@index([shop, status])
 }
