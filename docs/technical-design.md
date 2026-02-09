@@ -38,7 +38,6 @@ This app provides:
 
   * Price adjustment (percentage / fixed)
   * Tag add / remove
-  * Product status change (active / draft)
 * Preview mode (simulated diff)
 * Operation progress tracking
 * Operation history
@@ -77,7 +76,7 @@ These are intentionally excluded to keep the solution focused, reliable, and ali
 
 4. **Data Storage**
 
-   * Lightweight persistence (SQLite / Postgres) for:
+   * Lightweight persistence (SQLite) for:
 
      * Operation metadata
      * Undo payloads
@@ -99,7 +98,7 @@ These are intentionally excluded to keep the solution focused, reliable, and ali
        │     ├─ Product queries
        │     └─ bulkOperationRunMutation
        │
-       └─ Database (Operations / History)
+       └─ SQLite Database (Operations / History)
 
 ---
 
@@ -155,7 +154,6 @@ Examples:
 
 * Price +10% → Undo: −10%
 * Add tag → Undo: remove tag
-* Status active → Undo: draft
 
 Undo actions are stored per operation and executed via a new bulk operation.
 

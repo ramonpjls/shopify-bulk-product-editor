@@ -501,7 +501,7 @@ export default function Index() {
     return () => {
       clearInterval(pollInterval);
       console.log(
-        `⏹️ Stopped polling for ${operationToMonitor.bulkOperationId}`,
+        `⏹️ Stopped polling for ${operationToMonitor.bulkOperationId}, polled ${pollCount} times`,
       );
     };
   }, [operationToMonitor?.bulkOperationId]);
@@ -530,7 +530,7 @@ export default function Index() {
       });
       setTimeout(() => revalidator.revalidate(), 1000);
     }
-  }, [operationComplete, pollResult?.status]);
+               }, [operationComplete, pollResult?.status]);
 
   const toggleProduct = (productId: string) => {
     setSelectedProductIds((prev) =>
@@ -548,6 +548,8 @@ export default function Index() {
     setSelectedProductIds([]);
   };
 
+
+  // Check if the current selection matches the products in the preview to enable/disable the Start button
   const pricePreviewProductIds =
     pricePreview?.products?.map((product) => product.id) ?? [];
   const tagPreviewProductIds =
@@ -570,7 +572,7 @@ export default function Index() {
         {operationToMonitor && (
           <Layout.Section>
             <Banner
-              status={
+              tone={
                 pollResult?.status === "COMPLETED"
                   ? "success"
                   : pollResult?.status === "FAILED"
@@ -697,6 +699,7 @@ export default function Index() {
                   const selected = selectedProductIds.includes(product.id);
                   return (
                     <div
+                      key={product.id}
                       onClick={() => toggleProduct(product.id)}
                       style={{
                         cursor: "pointer",

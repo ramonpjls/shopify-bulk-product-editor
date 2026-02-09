@@ -1,7 +1,6 @@
 /**
- * Bulk Operations Service 
- *
- * Fixes:
+ * Bulk Operations Service - Handles starting, polling, and processing bulk operations for price adjustments and tag updates.
+ * 
  * - Graceful handling of "not found" bulk operations
  * - Better error messages
  * - Auto-cleanup of expired operations

@@ -4,6 +4,13 @@
 
 This project is a **custom Shopify Admin app** that allows merchants to safely perform **bulk updates on products** using Shopify’s **GraphQL Admin API and Bulk Operations**.
 
+[![Shopify App](https://img.shields.io/badge/Shopify-App-7AB55C?logo=shopify&logoColor=white)](https://www.shopify.com)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.0-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![React](https://img.shields.io/badge/React-18.0-61DAFB?logo=react&logoColor=black)](https://reactjs.org/)
+[![Remix](https://img.shields.io/badge/Remix-2.0-000000?logo=remix&logoColor=white)](https://remix.run/)
+
+---
+
 The app focuses on demonstrating:
 
 - Correct usage of Shopify bulk operations
